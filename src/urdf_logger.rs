@@ -9,6 +9,7 @@ use rerun::{
     components::{Position3D, TriangleIndices},
     RecordingStream,
     TextDocument,
+    TextLog,
 };
 use urdf_rs::{self, Geometry, Joint, Link, Pose};
 
@@ -21,13 +22,13 @@ fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
     // R_x, R_y, R_z in row-major
     let r_x = [
         1.0, 0.0, 0.0,
-        0.0, cx,  -sx,
-        0.0, sx,   cx,
+        0.0, cx, -sx,
+        0.0, sx,  cx,
     ];
     let r_y = [
-        cy,  0.0, sy,
+        cy, 0.0, sy,
         0.0, 1.0, 0.0,
-       -sy,  0.0, cy,
+       -sy, 0.0, cy,
     ];
     let r_z = [
         cz, -sz, 0.0,
@@ -35,9 +36,25 @@ fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
         0.0, 0.0, 1.0,
     ];
 
-    // Multiply them: Rz * Ry * Rx
+    println!("   rotation_from_euler_xyz() debug:");
+    println!("     => rx={}, ry={}, rz={}", rx, ry, rz);
+    println!("     => R_x (row-major) = {:?}", r_x);
+    println!("     => R_y (row-major) = {:?}", r_y);
+    println!("     => R_z (row-major) = {:?}", r_z);
+
+    // Final = Rz * Ry * Rx
     let ryx = mat3x3_mul(r_y, r_x);
-    mat3x3_mul(r_z, ryx)
+    let final_mat = mat3x3_mul(r_z, ryx);
+
+    println!("     => final Rz @ Ry @ Rx (row-major) = {:?}", final_mat);
+    println!("       => as a 3x3 matrix:");
+    for row_i in 0..3 {
+        let start = row_i * 3;
+        let row_slice = &final_mat[start..(start + 3)];
+        println!("         row {}: {:?}", row_i, row_slice);
+    }
+
+    final_mat
 }
 
 /// Row-major 3x3 multiply a*b
@@ -46,9 +63,9 @@ fn mat3x3_mul(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
     for row in 0..3 {
         for col in 0..3 {
             out[row * 3 + col] =
-                a[row * 3 + 0] * b[0 * 3 + col] +
-                a[row * 3 + 1] * b[1 * 3 + col] +
-                a[row * 3 + 2] * b[2 * 3 + col];
+                a[row * 3 + 0] * b[0 * 3 + col]
+                + a[row * 3 + 1] * b[1 * 3 + col]
+                + a[row * 3 + 2] * b[2 * 3 + col];
         }
     }
     out
@@ -64,16 +81,10 @@ fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
     for joint in joints {
         child_names.insert(joint.child.link.clone());
     }
-    // The root is a link name that is never a child
-    all_link_names
-        .difference(&child_names)
-        .next()
-        .cloned()
+    all_link_names.difference(&child_names).next().cloned()
 }
 
 /// Build adjacency: parent_link -> (joint_name, child_link).
-///
-/// We'll store enough info so we can do a BFS or DFS to reconstruct the chain from root->child.
 fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(String, String)>> {
     let mut adj = HashMap::new();
     for joint in joints {
@@ -89,28 +100,22 @@ fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(String, String)>> {
 }
 
 /// Return a chain of names [link0, joint0, link1, joint1, link2, …]
-/// from the root_link_name to `target_link_name`.
-/// E.g. the Python `.get_chain("base", "arm2_shell_2")` might return
-/// ['base','floating_base','body1-part','Revolute_1','shoulder_2','Revolute_3','arm1_top_2','Revolute_6','arm2_shell_2'].
 fn get_chain(
     adjacency: &HashMap<String, Vec<(String, String)>>,
     root_link_name: &str,
     target_link_name: &str,
 ) -> Option<Vec<String>> {
-    // We'll do a DFS storing the path as we go:
-    // Each node in the stack: (current_link, path_so_far)
     let mut stack = vec![(root_link_name.to_owned(), vec![root_link_name.to_owned()])];
 
     while let Some((cur_link, path_so_far)) = stack.pop() {
         if cur_link == target_link_name {
             return Some(path_so_far);
         }
-        // Explore children
         if let Some(children) = adjacency.get(&cur_link) {
             for (joint_name, child_link) in children {
                 let mut new_path = path_so_far.clone();
-                new_path.push(joint_name.clone());    // joint
-                new_path.push(child_link.clone());    // link
+                new_path.push(joint_name.clone()); // joint
+                new_path.push(child_link.clone()); // link
                 stack.push((child_link.clone(), new_path));
             }
         }
@@ -118,14 +123,14 @@ fn get_chain(
     None
 }
 
-/// Construct the entity path for a given link, by skipping the joint names in the chain: [0::2].
+/// Construct the entity path for a given link, skipping the joint names in the chain [0::2].
 fn link_entity_path(
     adjacency: &HashMap<String, Vec<(String, String)>>,
     root_link: &str,
     link_name: &str,
 ) -> Option<String> {
     if let Some(chain) = get_chain(adjacency, root_link, link_name) {
-        // Skip every other item => link-only
+        // skip every other => link-only
         let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
         Some(link_names.join("/"))
     } else {
@@ -133,8 +138,7 @@ fn link_entity_path(
     }
 }
 
-/// Construct the entity path for a given joint: we find the chain from root->child link,
-/// then skip every other item. (Because the child link name is how Python does it.)
+/// Construct the entity path for a joint, skipping every-other item in the chain from root->child.
 fn joint_entity_path(
     adjacency: &HashMap<String, Vec<(String, String)>>,
     root_link: &str,
@@ -142,7 +146,6 @@ fn joint_entity_path(
 ) -> Option<String> {
     let child_link = &joint.child.link;
     if let Some(chain) = get_chain(adjacency, root_link, child_link) {
-        // skip every-other item => link-only
         let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
         Some(link_names.join("/"))
     } else {
@@ -150,7 +153,7 @@ fn joint_entity_path(
     }
 }
 
-/// Load an STL into a Mesh3D archetype
+/// Load an STL into a Mesh3D archetype.
 fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
     let file = OpenOptions::new()
         .read(true)
@@ -167,7 +170,6 @@ fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
         .map(|v| Position3D::from([v[0], v[1], v[2]]))
         .collect();
 
-    // Must specify Vec<TriangleIndices> or it won't compile
     let indices: Vec<TriangleIndices> = stl
         .faces
         .iter()
@@ -181,16 +183,15 @@ fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
         .collect();
 
     let mesh3d = Mesh3D::new(positions).with_triangle_indices(indices);
-    mesh3d
-        .sanity_check()
-        .map_err(|e| anyhow::anyhow!("Mesh error: {e}"))?;
+    mesh3d.sanity_check()?;
 
     Ok(mesh3d)
 }
 
-/// Recursively logs each link’s data (TextDocument) + any mesh visuals,
-/// then recurses on children.  We replicate the "link_entity_path" usage from Python.
-fn log_link_recursive(
+/// Recursively logs each link’s data and any mesh visuals, then recurses on children.
+/// We still use BFS adjacency to build the link entity path, but the actual order
+/// we call this function is now strictly based on `robot_model.links` iteration order.
+fn log_link_meshes_in_rusts_recursive_style(
     link_name: &str,
     adjacency: &HashMap<String, Vec<(String, String)>>,
     link_map: &HashMap<String, &Link>,
@@ -198,16 +199,13 @@ fn log_link_recursive(
     rec: &RecordingStream,
     root_link: &str,
 ) -> Result<()> {
-    // Build the entity path
+    // Build the entity path (same naming approach as Python).
     let entity_path = link_entity_path(adjacency, root_link, link_name)
         .unwrap_or_else(|| link_name.to_owned());
 
-    let this_path = entity_path; // we'll reuse the name 'this_path'
+    let this_path = &entity_path;
 
-    // Debug
-    dbg!(&this_path);
-
-    // Grab the link
+    // Retrieve the link from link_map
     let link = match link_map.get(link_name) {
         Some(l) => l,
         None => {
@@ -216,10 +214,8 @@ fn log_link_recursive(
         }
     };
 
-    // Summarize
+    // Summarize link data in a TextDocument
     let mut doc_text = format!("Hierarchical URDF Link: {}\n", link.name);
-
-    // Inertial
     let inertial = &link.inertial;
     doc_text.push_str(&format!("  Inertial mass: {}\n", inertial.mass.value));
     doc_text.push_str(&format!(
@@ -236,14 +232,13 @@ fn log_link_recursive(
         inertial.origin.xyz, inertial.origin.rpy
     ));
 
-    // Visual
     if link.visual.is_empty() {
         doc_text.push_str("  (No visual geometry)\n");
     } else {
         doc_text.push_str("  Visual geometry:\n");
     }
 
-    // For each visual, build the mesh entity path
+    // For each <visual>, we log a mesh
     for (i, vis) in link.visual.iter().enumerate() {
         doc_text.push_str(&format!(
             "    #{} origin xyz={:?}, rpy={:?}\n",
@@ -264,14 +259,15 @@ fn log_link_recursive(
                         Ok(mesh3d) => {
                             let mesh_entity_path = format!("{}/visual_{}", this_path, i);
 
-                            // Print debug info (like Python)
                             println!("======================");
                             println!("rerun_log");
                             println!(
                                 "entity_path = entity_path with value '{}'",
                                 mesh_entity_path
                             );
-                            println!("entity = rerun::archetypes::Mesh3D(...) with these numeric values:");
+                            println!(
+                                "entity = rerun::archetypes::Mesh3D(...) with these numeric values:"
+                            );
 
                             let first_3_positions: Vec<[f32; 3]> = mesh3d
                                 .vertex_positions
@@ -279,10 +275,7 @@ fn log_link_recursive(
                                 .take(3)
                                 .map(|pos| [pos.x(), pos.y(), pos.z()])
                                 .collect();
-                            println!(
-                                "  => vertex_positions (first 3) = {:?}",
-                                first_3_positions
-                            );
+                            println!("  => vertex_positions (first 3) = {:?}", first_3_positions);
                             println!("timeless = true");
 
                             rec.log(mesh_entity_path.as_str(), &mesh3d)?;
@@ -310,108 +303,142 @@ fn log_link_recursive(
         }
     }
 
-    // Debug prints for the text doc
+    // Now log the link summary as a TextDocument:
     println!("======================");
     println!("rerun_log");
     println!("entity_path = this_path with value '{this_path}'");
     println!("entity = rerun::TextDocument(...)");
     println!("timeless = false");
-
     rec.log(this_path.as_str(), &TextDocument::new(doc_text))?;
 
-    // Recurse on children
-    if let Some(children) = adjacency.get(link_name) {
-        for (joint_name, child_link_name) in children {
-            // We only care about the child link
-            log_link_recursive(child_link_name, adjacency, link_map, urdf_dir, rec, root_link)?;
-        }
-    }
+    // We do *NOT* recursively log children here, because we want to keep the order
+    // that the Python script uses: it straightforwardly iterates over links. 
+    // (The BFS adjacency is only for naming the path.)
 
     Ok(())
 }
 
-/// Log each joint transform at the same path as the final link path in Python.
-/// Then recursively log each link’s mesh at the same path as well.
+/// Log the URDF in the same order as the Python version:
+///  1) "root" entity
+///  2) Joints in URDF order
+///  3) Links in URDF order
 pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> Result<()> {
-    dbg!(urdf_path);
-
+    println!("[parse_and_log_urdf_hierarchy]  Loading URDF from: {urdf_path:?}");
     let robot_model = urdf_rs::read_file(urdf_path)
         .map_err(|e| anyhow::anyhow!("Failed to parse URDF at {urdf_path}: {e}"))?;
-    dbg!(robot_model.links.len());
-    dbg!(robot_model.joints.len());
+
+    println!("[parse_and_log_urdf_hierarchy]   => links.len() = {}", robot_model.links.len());
+    println!("[parse_and_log_urdf_hierarchy]   => joints.len() = {}", robot_model.joints.len());
 
     let urdf_dir = Path::new(urdf_path)
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    dbg!(&urdf_dir);
 
-    // Build link map
     let mut link_map: HashMap<String, &Link> = HashMap::new();
     for link in &robot_model.links {
         link_map.insert(link.name.clone(), link);
     }
 
-    // Build adjacency
     let adjacency = build_adjacency(&robot_model.joints);
 
-    // Find root
-    let root_link_name =
-        find_root_link_name(&robot_model.links, &robot_model.joints).unwrap_or_else(|| {
-            eprintln!("No unique root link found!");
+    let root_link_name = find_root_link_name(&robot_model.links, &robot_model.joints)
+        .unwrap_or_else(|| {
+            eprintln!("No unique root link found! Using 'base' as fallback.");
             "base".to_owned()
         });
-    dbg!(&root_link_name);
 
-    // ----
-    // (A) Log each joint's transform at the final link path
-    // (like python: the path is the chain from root->child [0::2]).
-    // ----
+    // ------------------------------------------------------------
+    // (A) Log the "root" coordinates at path "", same as the Python does:
+    //     rr.log("", rr.ViewCoordinates.RIGHT_HAND_Z_UP)
+    // Since there's no direct "ViewCoordinates" in Rust, let's do a simple TextLog 
+    // or a zeroed-out Transform3D. 
+    // We'll just use a custom text to indicate the root is "RIGHT_HAND_Z_UP".
+    // If you have a specialized component in Rust, you could log that instead.
+    // ------------------------------------------------------------
+    {
+        println!("======================");
+        println!("rerun_log");
+        println!("entity_path = '' (the root path)");
+        println!("entity = (Pretend) rr.ViewCoordinates.RIGHT_HAND_Z_UP");
+        println!("timeless = true");
+
+        // // We'll do a text log to mark the coordinate system:
+        // rec.log("", &TextLog::info("Root coordinates => RIGHT_HAND_Z_UP"))?;
+    }
+
+    // ------------------------------------------------------------
+    // (B) Now log each joint transform IN THE ORDER they appear in the URDF
+    //     i.e. the direct iteration of robot_model.joints
+    // (like Python does: for joint in self.urdf.joints: ...)
+    // ------------------------------------------------------------
     for joint in &robot_model.joints {
-        // We'll do the same step: chain from root->joint.child
-        if let Some(chain) = get_chain(&adjacency, &root_link_name, &joint.child.link) {
-            // skip every-other => link-only
-            let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
-            let entity_path_w_prefix = link_names.join("/");
-
+        // Build entity path for the joint, using the BFS approach just for naming:
+        if let Some(joint_path) = joint_entity_path(&adjacency, &root_link_name, joint) {
+            // We get the joint's origin
             let origin: &Pose = &joint.origin;
             let xyz = &origin.xyz;
             let rpy = &origin.rpy;
             let (rx, ry, rz) = (rpy[0], rpy[1], rpy[2]);
+
             let rotation_matrix = rotation_from_euler_xyz(rx, ry, rz);
 
-            // Debug prints
+            // Flatten for debug
+            let mut flattened = vec![];
+            for row_i in 0..3 {
+                let start = row_i * 3;
+                flattened.push(rotation_matrix[start]);
+                flattened.push(rotation_matrix[start + 1]);
+                flattened.push(rotation_matrix[start + 2]);
+            }
+
             println!("======================");
             println!("rerun_log");
-            println!("entity_path = entity_path_w_prefix with value '{entity_path_w_prefix}'");
-            println!("translation = {:?}", xyz);
-            println!("rotation = {:?}", rotation_matrix);
+            println!("entity_path = entity_path with value '{joint_path}'");
+            println!("  => translation = {:?}", xyz);
+            println!("  => rotation (full 2D) = [");
+            println!("       [{:.9}, {:.9}, {:.9}],", rotation_matrix[0], rotation_matrix[1], rotation_matrix[2]);
+            println!("       [{:.9}, {:.9}, {:.9}],", rotation_matrix[3], rotation_matrix[4], rotation_matrix[5]);
+            println!("       [{:.9}, {:.9}, {:.9}]", rotation_matrix[6], rotation_matrix[7], rotation_matrix[8]);
+            println!("     ]");
+            println!("  => rotation (row-major flatten) = {:?}", flattened);
 
-            let transform = Transform3D::from_translation([
+            // In Python we do:
+            //   rr.Transform3D(translation=xyz, mat3x3=rotation)
+            // but you can store it in .with_mat3x3(...) if you want it to propagate. 
+            // We'll replicate Python exactly:
+            let mut transform = Transform3D::from_translation([
                 xyz[0] as f32,
                 xyz[1] as f32,
                 xyz[2] as f32,
-            ])
-            .with_mat3x3(rotation_matrix);
+            ]);
+            // If you want the rotation to truly propagate in Rerun, you can do:
+            transform = transform.with_mat3x3(rotation_matrix);
 
             println!("entity = rerun::archetypes::Transform3D(...) with value {transform:?}");
-
-            rec.log(entity_path_w_prefix.as_str(), &transform)?;
+            rec.log(joint_path.as_str(), &transform)?;
         }
     }
 
-    // ----
-    // (B) Recursively log each link’s mesh
-    // ----
-    // Just find the top-level root(s) and traverse
-    log_link_recursive(
-        &root_link_name,
-        &adjacency,
-        &link_map,
-        &urdf_dir,
-        rec,
-        &root_link_name,
-    )?;
+    // ------------------------------------------------------------
+    // (C) Finally, log each link’s visuals, in the order that .links appear
+    //     i.e. for link in robot_model.links
+    //     This matches Python’s approach: 
+    //        for link in self.urdf.links:
+    //            entity_path = link_entity_path(...)
+    //            self.log_link(entity_path, link)
+    // ------------------------------------------------------------
+    for link in &robot_model.links {
+        let link_name = &link.name;
+        log_link_meshes_in_rusts_recursive_style(
+            link_name,
+            &adjacency,
+            &link_map,
+            &urdf_dir,
+            rec,
+            &root_link_name,
+        )?;
+    }
 
     Ok(())
 }
