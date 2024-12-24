@@ -11,6 +11,9 @@ rerun = { version = "0.21.0", features = ["run"] }
 urdf-rs = "0.9.0"
 tobj = "4.0.2"
 stl_io = "0.8.3"
+parry3d = "0.17.4"
+nalgebra = "0.33.2"
+image = "0.25.5"
 
 [[bin]]
 name = "rerun-loader-krecviz"
