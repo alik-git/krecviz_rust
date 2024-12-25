@@ -1,15 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rerun::{
-    archetypes::{Mesh3D, Transform3D},
+    archetypes::{Mesh3D},
     components::{Blob as _, Blob, ImageBuffer, ImageFormat, Position3D, TriangleIndices},
     RecordingStream,
     TextDocument,
-    TextLog,
 };
 use urdf_rs::{self, Color, Geometry, Joint, Link, Material, Pose};
 
@@ -26,69 +25,38 @@ struct RrMaterialInfo {
     texture_path: Option<PathBuf>,
 }
 
-/// Convert Euler angles to row-major 3x3 rotation matrix.
-/// Now with an EXTRA manual 90° rotation about X appended at the end.
+// ----------------------------------------------------------------------------
+// Utilities for 3×3 & 4×4 transforms
+
+/// Convert Euler angles (rx, ry, rz) to row-major 3x3 rotation matrix: final_mat = Rz * Ry * Rx.
 fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
     let (cx, sx) = (rx.cos() as f32, rx.sin() as f32);
     let (cy, sy) = (ry.cos() as f32, ry.sin() as f32);
     let (cz, sz) = (rz.cos() as f32, rz.sin() as f32);
 
     let r_x = [
-        1.0, 0.0,  0.0,
+        1.0, 0.0, 0.0,
         0.0, cx,  -sx,
         0.0, sx,   cx,
     ];
 
     let r_y = [
-        cy,  0.0,  sy,
-        0.0, 1.0,  0.0,
-       -sy,  0.0,  cy,
+        cy,  0.0, sy,
+        0.0, 1.0, 0.0,
+       -sy,  0.0, cy,
     ];
 
     let r_z = [
-        cz, -sz,  0.0,
-        sz,  cz,  0.0,
+        cz, -sz, 0.0,
+        sz,  cz, 0.0,
         0.0, 0.0, 1.0,
     ];
 
-    // For illustration, pick some multiply order:
-    // final_mat = Rz * Ry * Rx
     let ryx = mat3x3_mul(r_y, r_x);
-    let mut final_mat = mat3x3_mul(r_z, ryx);
-
-    // -------------------------------------------------
-    // EXTRA SHIFT: a manual +90° about X
-    //   i.e. angle = +pi/2
-    // In row-major, that is:
-    //   [1,  0,  0,
-    //    0,  0, -1,
-    //    0,  1,  0]
-    // Let’s call it manual_rx_90:
-    let manual_rx_90 = [
-         1.4,  0.3,  0.0,
-         0.0,  1.6, -1.0,
-         0.1,  -0.3,  -1.2,
-    ];
-    // Multiply it in (depending on which side you want to rotate from).
-    // E.g. post-multiply:
-    final_mat = mat3x3_mul(manual_rx_90, final_mat);
-    // -------------------------------------------------
-
-    // Print a debug snippet:
-    println!("=== rotation_from_euler_xyz() debug ===");
-    println!("rx = {}, ry = {}, rz = {}", rx, ry, rz);
-    println!("r_x (row-major) = {:?}", r_x);
-    println!("r_y (row-major) = {:?}", r_y);
-    println!("r_z (row-major) = {:?}", r_z);
-    println!("final_mat BEFORE manual +90° about X (RzRyRx) = {:?}", mat3x3_mul(r_z, ryx));
-    println!("manual_rx_90 = {:?}", manual_rx_90);
-    println!("final_mat AFTER manual +90° about X = {:?}", final_mat);
-    println!("========================================");
-
-    final_mat
+    mat3x3_mul(r_z, ryx)
 }
 
-/// Multiply row-major 3x3 a*b
+/// Multiply two row-major 3x3 matrices (a*b).
 fn mat3x3_mul(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
     let mut out = [0.0; 9];
     for row in 0..3 {
@@ -102,20 +70,84 @@ fn mat3x3_mul(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
     out
 }
 
-/// Build adjacency: parent_link -> Vec<(joint_name, child_link)>
-fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(String, String)>> {
+/// Build a row-major 4x4 transform from xyz + rpy (Euler angles).
+fn build_4x4_from_xyz_rpy(xyz: [f64; 3], rpy: [f64; 3]) -> [f32; 16] {
+    let rot3x3 = rotation_from_euler_xyz(rpy[0], rpy[1], rpy[2]);
+    [
+        rot3x3[0], rot3x3[1], rot3x3[2], xyz[0] as f32,
+        rot3x3[3], rot3x3[4], rot3x3[5], xyz[1] as f32,
+        rot3x3[6], rot3x3[7], rot3x3[8], xyz[2] as f32,
+        0.0,       0.0,       0.0,       1.0,
+    ]
+}
+
+/// Multiply two row-major 4x4 matrices (a*b).
+fn mat4x4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
+    let mut out = [0.0; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            let mut val = 0.0;
+            for k in 0..4 {
+                val += a[row * 4 + k] * b[k * 4 + col];
+            }
+            out[row * 4 + col] = val;
+        }
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Baked transform for a Mesh3D
+
+/// Like Python `mesh.apply_transform(transform)`, applying a 4x4 in row-major to vertex positions (and normals).
+fn apply_4x4_to_mesh3d(mesh: &mut Mesh3D, transform: [f32; 16]) {
+    // Positions: treat as (x,y,z,1)
+    for vertex in &mut mesh.vertex_positions {
+        let x = vertex[0];
+        let y = vertex[1];
+        let z = vertex[2];
+        let w = 1.0;
+        let xp = transform[0] * x + transform[1] * y + transform[2] * z + transform[3] * w;
+        let yp = transform[4] * x + transform[5] * y + transform[6] * z + transform[7] * w;
+        let zp = transform[8] * x + transform[9] * y + transform[10] * z + transform[11] * w;
+        vertex[0] = xp;
+        vertex[1] = yp;
+        vertex[2] = zp;
+    }
+    // Normals: treat as (nx, ny, nz, 0) (no translation)
+    if let Some(ref mut normals) = mesh.vertex_normals {
+        for normal in normals {
+            let nx = normal[0];
+            let ny = normal[1];
+            let nz = normal[2];
+            let w = 0.0;
+            let nxp = transform[0] * nx + transform[1] * ny + transform[2] * nz + transform[3] * w;
+            let nyp = transform[4] * nx + transform[5] * ny + transform[6] * nz + transform[7] * w;
+            let nzp = transform[8] * nx + transform[9] * ny + transform[10] * nz + transform[11] * w;
+            normal[0] = nxp;
+            normal[1] = nyp;
+            normal[2] = nzp;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Adjacency + BFS to compute global transforms
+
+/// Build adjacency: parent_link -> Vec<(joint, child_link)>
+fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(Joint, String)>> {
     let mut adj = HashMap::new();
     for j in joints {
-        let parent_link = j.parent.link.clone();
-        let child_link = j.child.link.clone();
-        adj.entry(parent_link)
+        let parent_link_name = j.parent.link.clone();
+        let child_link_name = j.child.link.clone();
+        adj.entry(parent_link_name)
             .or_insert_with(Vec::new)
-            .push((j.name.clone(), child_link));
+            .push((j.clone(), child_link_name));
     }
     adj
 }
 
-/// Return name of the root link: the link that never appears as a child
+/// Find the link that never appears as a child → typically the root.
 fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
     let mut all_links = HashSet::new();
     let mut child_links = HashSet::new();
@@ -128,9 +160,53 @@ fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
     all_links.difference(&child_links).next().cloned()
 }
 
-/// BFS approach: gather chain [link0, joint0, link1, joint1, link2,…]
+/// For each link, compute its global transform from the root by chaining all the joint transforms.
+fn build_link_global_transforms(
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
+    root_link_name: &str,
+    joints: &[Joint],
+) -> HashMap<String, [f32; 16]> {
+    let mut link_to_tf = HashMap::new();
+
+    // The root link gets an identity transform
+    link_to_tf.insert(root_link_name.to_owned(), [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]);
+
+    // BFS queue: (current_link_name)
+    let mut queue = VecDeque::new();
+    queue.push_back(root_link_name.to_owned());
+
+    while let Some(cur_link) = queue.pop_front() {
+        let cur_tf = link_to_tf.get(&cur_link).cloned().unwrap();
+
+        if let Some(child_joints) = adjacency.get(&cur_link) {
+            for (j, child_link_name) in child_joints {
+                // Convert Vec3 to arrays for xyz and rpy
+                let xyz = [j.origin.xyz[0], j.origin.xyz[1], j.origin.xyz[2]];
+                let rpy = [j.origin.rpy[0], j.origin.rpy[1], j.origin.rpy[2]];
+                let local_tf = build_4x4_from_xyz_rpy(xyz, rpy);
+                let child_tf = mat4x4_mul(cur_tf, local_tf);
+                link_to_tf.insert(child_link_name.clone(), child_tf);
+
+                // Enqueue child
+                queue.push_back(child_link_name.clone());
+            }
+        }
+    }
+
+    link_to_tf
+}
+
+// ----------------------------------------------------------------------------
+// For building the BFS chain from root -> link to get entity path for logging
+
+/// BFS-based approach to gather [link0, joint0, link1, joint1, link2,…] to build a path string
 fn get_chain(
-    adjacency: &HashMap<String, Vec<(String, String)>>,
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
     root_link: &str,
     target_link: &str,
 ) -> Option<Vec<String>> {
@@ -140,9 +216,9 @@ fn get_chain(
             return Some(path_so_far);
         }
         if let Some(children) = adjacency.get(&cur_link) {
-            for (joint_name, child_link) in children {
+            for (joint, child_link) in children {
                 let mut new_path = path_so_far.clone();
-                new_path.push(joint_name.clone());
+                new_path.push(joint.name.clone());
                 new_path.push(child_link.clone());
                 stack.push((child_link.clone(), new_path));
             }
@@ -151,9 +227,9 @@ fn get_chain(
     None
 }
 
-/// Construct entity path for a link, skipping joints in BFS chain.
+/// Construct entity path for a link by skipping every-other item in BFS chain
 fn link_entity_path(
-    adjacency: &HashMap<String, Vec<(String, String)>>,
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
     root_link: &str,
     link_name: &str,
 ) -> Option<String> {
@@ -165,22 +241,10 @@ fn link_entity_path(
     }
 }
 
-/// Construct entity path for a joint, skipping every-other item in BFS chain.
-fn joint_entity_path(
-    adjacency: &HashMap<String, Vec<(String, String)>>,
-    root_link: &str,
-    joint: &Joint,
-) -> Option<String> {
-    let child_link = &joint.child.link;
-    if let Some(chain) = get_chain(adjacency, root_link, child_link) {
-        let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
-        Some(link_names.join("/"))
-    } else {
-        None
-    }
-}
+// ----------------------------------------------------------------------------
+// Loading geometry + materials
 
-/// Load .stl as Mesh3D
+/// Load .stl into a Mesh3D
 fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
     let f = OpenOptions::new()
         .read(true)
@@ -215,10 +279,9 @@ fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
 /// Parse color/texture from a URDF <material>
 fn parse_urdf_material(mat: &Material, urdf_dir: &Path) -> RrMaterialInfo {
     let mut info = RrMaterialInfo::default();
-    // if <color> is present
+    // If <color> is present
     if let Some(c) = &mat.color {
-        // Vec4 derefs to [f64; 4], so we can index it directly
-        let rgba = &*c.rgba; // dereference to get the array
+        let rgba = &*c.rgba; // [f64; 4]
         info.color_rgba = Some([
             rgba[0] as f32,
             rgba[1] as f32,
@@ -226,15 +289,13 @@ fn parse_urdf_material(mat: &Material, urdf_dir: &Path) -> RrMaterialInfo {
             rgba[3] as f32,
         ]);
     }
-
-    // if <texture> is present
+    // If <texture> is present
     if let Some(tex) = &mat.texture {
         let abs = urdf_dir.join(&tex.filename);
         if abs.exists() {
             info.texture_path = Some(abs);
         }
     }
-
     info
 }
 
@@ -249,40 +310,35 @@ fn float_rgba_to_u8(rgba: [f32; 4]) -> [u8; 4] {
 }
 
 /// Load an image from disk → Rerun ImageBuffer
-fn load_image_as_rerun_buffer(path: &Path) -> Result<ImageBuffer> {
+fn load_image_as_rerun_buffer(path: &Path) -> Result<rerun::components::ImageBuffer> {
     let img = image::open(path)
         .map_err(|e| anyhow::anyhow!("Failed to open {path:?}: {e}"))?;
     let rgba8 = img.to_rgba8().into_raw(); // Vec<u8>
-
-    // Rerun's data blob:
     let data_blob: rerun::datatypes::Blob = rgba8.into();
     let image_buf = ImageBuffer(data_blob);
     Ok(image_buf)
 }
 
-/// The main BFS-based link geometry logging.  
-/// We replicate Python logic to handle global named materials too!
-fn log_link_meshes_in_rusts_recursive_style(
-    link_name: &str,
-    adjacency: &HashMap<String, Vec<(String, String)>>,
-    link_map: &HashMap<String, &Link>,
+// ----------------------------------------------------------------------------
+// Logging each link's geometry: now with global transform
+
+/// For each link.visual:
+///  1) Retrieve that link's global transform from BFS map (`link_global_tf`).
+///  2) Build local visual transform from <origin xyz rpy>.
+///  3) final_tf = link_global_tf * local_visual_tf
+///  4) apply final_tf to the mesh
+///  5) log
+fn log_link_with_global_transform(
+    link: &Link,
+    link_global_tf: [f32; 16],
+    entity_path: &str,
     urdf_dir: &PathBuf,
+    all_materials_map: &HashMap<String, &Material>,
     rec: &RecordingStream,
-    root_link: &str,
-    all_materials_map: &HashMap<String, &Material>, // newly added
 ) -> Result<()> {
-    let entity_path = link_entity_path(adjacency, root_link, link_name)
-        .unwrap_or_else(|| link_name.to_owned());
-
-    let link = match link_map.get(link_name) {
-        Some(l) => l,
-        None => {
-            eprintln!("Warning: link {link_name} not found in link_map!");
-            return Ok(());
-        }
-    };
-
     let mut doc_text = format!("Hierarchical URDF Link: {}\n", link.name);
+
+    // Inertial summary
     let inertial = &link.inertial;
     doc_text.push_str(&format!("  Inertial mass: {}\n", inertial.mass.value));
     doc_text.push_str(&format!(
@@ -305,31 +361,30 @@ fn log_link_meshes_in_rusts_recursive_style(
         doc_text.push_str("  Visual geometry:\n");
     }
 
+    // Each visual
     for (i, vis) in link.visual.iter().enumerate() {
         doc_text.push_str(&format!(
             "    #{} origin xyz={:?}, rpy={:?}\n",
             i, vis.origin.xyz, vis.origin.rpy
         ));
 
-        // Step (1): gather material info.
+        // (1) gather material info
         let mut mat_info = RrMaterialInfo::default();
         if let Some(vis_mat) = &vis.material {
-            // If inline <material> has no <color> or <texture> => it's a reference to global <material name="..."/>
-            let mat_name = &vis_mat.name; // e.g. "blue"
+            let mat_name = &vis_mat.name;
+            // If color/texture is None, assume named reference
             if vis_mat.color.is_none() && vis_mat.texture.is_none() {
-                // Look up global
                 if let Some(global_mat) = all_materials_map.get(mat_name) {
                     mat_info = parse_urdf_material(global_mat, urdf_dir);
                 }
             } else {
-                // inline color or texture
                 mat_info = parse_urdf_material(vis_mat, urdf_dir);
             }
         }
 
-        // Step (2): build geometry
+        // (2) build geometry
         let mesh_entity_path = format!("{}/visual_{}", entity_path, i);
-        let (mesh3d, extra_txt) = match &vis.geometry {
+        let (mut mesh3d, extra_txt) = match &vis.geometry {
             Geometry::Mesh { filename, scale } => {
                 let abs_path = urdf_dir.join(filename);
                 let mut txt = format!("      Mesh file={:?}, scale={scale:?}\n", abs_path);
@@ -357,11 +412,11 @@ fn log_link_meshes_in_rusts_recursive_style(
                 let (raw_v, raw_i) = cuboid.to_trimesh();
                 let positions: Vec<Position3D> = raw_v
                     .iter()
-                    .map(|p| Position3D::new(p.x, p.y, p.z))
+                    .map(|p| Position3D::from([p.x, p.y, p.z]))
                     .collect();
                 let tri_idxs: Vec<TriangleIndices> = raw_i
                     .iter()
-                    .map(|[a,b,c]| TriangleIndices::from([*a, *b, *c]))
+                    .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
                     .collect();
                 let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
                 (mesh, msg)
@@ -373,11 +428,11 @@ fn log_link_meshes_in_rusts_recursive_style(
                 let (raw_v, raw_i) = cyl.to_trimesh(30);
                 let positions: Vec<Position3D> = raw_v
                     .iter()
-                    .map(|p| Position3D::new(p.x, p.y, p.z))
+                    .map(|p| Position3D::from([p.x, p.y, p.z]))
                     .collect();
                 let tri_idxs: Vec<TriangleIndices> = raw_i
                     .iter()
-                    .map(|[a,b,c]| TriangleIndices::from([*a, *b, *c]))
+                    .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
                     .collect();
                 let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
                 (mesh, msg)
@@ -388,11 +443,11 @@ fn log_link_meshes_in_rusts_recursive_style(
                 let (raw_v, raw_i) = ball.to_trimesh(20, 20);
                 let positions: Vec<Position3D> = raw_v
                     .iter()
-                    .map(|p| Position3D::new(p.x, p.y, p.z))
+                    .map(|p| Position3D::from([p.x, p.y, p.z]))
                     .collect();
                 let tri_idxs: Vec<TriangleIndices> = raw_i
                     .iter()
-                    .map(|[a,b,c]| TriangleIndices::from([*a, *b, *c]))
+                    .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
                     .collect();
                 let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
                 (mesh, msg)
@@ -404,112 +459,128 @@ fn log_link_meshes_in_rusts_recursive_style(
         };
         doc_text.push_str(&extra_txt);
 
-        // Step (3): apply color or texture
-        let mut final_mesh = mesh3d;
+        // (3) Build the local visual transform
+        let xyz = [vis.origin.xyz[0], vis.origin.xyz[1], vis.origin.xyz[2]];
+        let rpy = [vis.origin.rpy[0], vis.origin.rpy[1], vis.origin.rpy[2]];
+        let local_tf = build_4x4_from_xyz_rpy(xyz, rpy);
+
+        // (4) final_tf = link_global_tf * local_tf
+        let final_tf = mat4x4_mul(link_global_tf, local_tf);
+
+        // (5) Bake transform
+        apply_4x4_to_mesh3d(&mut mesh3d, final_tf);
+
+        // (6) Apply color/texture
         if let Some(rgba) = mat_info.color_rgba {
             let col_u8 = float_rgba_to_u8(rgba);
-            let n_verts = final_mesh.vertex_positions.len();
+            let n_verts = mesh3d.vertex_positions.len();
             let mut all_colors = Vec::with_capacity(n_verts);
             for _ in 0..n_verts {
                 all_colors.push(col_u8);
             }
-            final_mesh = final_mesh.with_vertex_colors(all_colors);
+            mesh3d = mesh3d.with_vertex_colors(all_colors);
         }
         if let Some(tex_path) = &mat_info.texture_path {
             match load_image_as_rerun_buffer(tex_path) {
                 Ok(img_buf) => {
-                    // We'll just do a dummy dimension:
-                    // If you want correct dimension, do `let (w,h) = image::image_dimensions(tex_path)?;`
-                    let (w, h) = image::image_dimensions(tex_path).unwrap_or((1,1));
+                    let (w, h) = image::image_dimensions(tex_path).unwrap_or((1, 1));
                     let format = ImageFormat::rgba8([w, h]);
-                    final_mesh = final_mesh.with_albedo_texture(format, img_buf);
+                    mesh3d = mesh3d.with_albedo_texture(format, img_buf);
                 }
                 Err(e) => eprintln!("Warning: failed to load texture {tex_path:?}: {e}"),
             }
         }
 
-        // Step (4): log
+        // (7) Log final mesh
         println!("======================");
         println!("rerun_log");
         println!("entity_path = '{}'", mesh_entity_path);
-        println!(" => geometry has {} vertices", final_mesh.vertex_positions.len());
-        rec.log(mesh_entity_path.as_str(), &final_mesh)?;
+        println!(" => geometry has {} vertices", mesh3d.vertex_positions.len());
+        rec.log(mesh_entity_path.as_str(), &mesh3d)?;
     }
 
-    // Summarize link
-    let link_entity_path = entity_path.as_str();
+    // Summarize link in a TextDocument
     println!("======================");
     println!("rerun_log");
-    println!("entity_path = '{}'", link_entity_path);
+    println!("entity_path = '{}'", entity_path);
     println!("entity = rerun::TextDocument(...)");
-    rec.log(link_entity_path, &TextDocument::new(doc_text))?;
+    rec.log(entity_path, &TextDocument::new(doc_text))?;
 
     Ok(())
 }
 
-/// The main function that replicates the Python logic:
-///  1) root
-///  2) each joint transform
-///  3) each link’s geometry
+// ----------------------------------------------------------------------------
+// Main entry point: parse URDF, BFS to build global link transforms, then log
+
 pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> Result<()> {
+    // Parse URDF
     let robot_model = urdf_rs::read_file(urdf_path)
         .map_err(|e| anyhow::anyhow!("Failed to parse URDF {urdf_path:?}: {e}"))?;
 
     // Build adjacency
     let adjacency = build_adjacency(&robot_model.joints);
 
-    // Find root
+    // Find root link
     let root_link_name = find_root_link_name(&robot_model.links, &robot_model.joints)
         .unwrap_or_else(|| "base".to_owned());
 
-    // Collect global named materials:
+    // Build a map link_name -> [f32;16] for each link's global transform
+    let link_global_tf_map = build_link_global_transforms(&adjacency, &root_link_name, &robot_model.joints);
+
+    // Collect global named materials
     let mut all_materials_map = HashMap::new();
     for m in &robot_model.materials {
         all_materials_map.insert(m.name.clone(), m);
     }
 
-    // (A) Log root
+    // (A) Just log the root as a “view coordinates” or something similar
     println!("======================");
     println!("rerun_log");
     println!("entity_path = '' (root path)");
     println!("entity = (Pretend) rr.ViewCoordinates.RIGHT_HAND_Z_UP");
     println!("timeless = true");
 
-    // (B) Log each joint transform
-    for j in &robot_model.joints {
-        if let Some(joint_path) = joint_entity_path(&adjacency, &root_link_name, j) {
-            let xyz = j.origin.xyz;
-            let rpy = j.origin.rpy;
-            let mat = rotation_from_euler_xyz(rpy[0], rpy[1], rpy[2]);
-            let mut tf = Transform3D::from_translation([xyz[0] as f32, xyz[1] as f32, xyz[2] as f32]);
-            tf = tf.with_mat3x3(mat);
+    // (B) BFS chain for each link => log the geometry with the accumulated transform
+    let urdf_dir = Path::new(urdf_path)
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
-            println!("======================");
-            println!("rerun_log");
-            println!("entity_path = '{}'", joint_path);
-            println!(" => translation={xyz:?}, rotation= {mat:?}");
-            rec.log(joint_path.as_str(), &tf)?;
-        }
-    }
-
-    // (C) For each link, BFS log geometry
+    // We’ll still gather link references in a map for direct access
     let mut link_map: HashMap<String, &Link> = HashMap::new();
     for l in &robot_model.links {
         link_map.insert(l.name.clone(), l);
     }
 
-    let urdf_dir = Path::new(urdf_path).parent().map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
+    // For each link in the URDF
     for link in &robot_model.links {
-        log_link_meshes_in_rusts_recursive_style(
-            &link.name,
-            &adjacency,
-            &link_map,
+        let link_name = &link.name;
+        let entity_path = link_entity_path(&adjacency, &root_link_name, link_name)
+            .unwrap_or_else(|| link_name.to_owned());
+
+        // Grab the link’s global transform from BFS
+        let link_global_tf = link_global_tf_map
+            .get(link_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                eprintln!("Warning: no global transform found for link {}", link_name);
+                // default identity
+                [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ]
+            });
+
+        // Log the link’s geometry with the fully accumulated transform
+        log_link_with_global_transform(
+            link,
+            link_global_tf,
+            &entity_path,
             &urdf_dir,
+            &all_materials_map,
             rec,
-            &root_link_name,
-            &all_materials_map, // pass global named materials
         )?;
     }
 
