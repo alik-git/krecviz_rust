@@ -1,8 +1,216 @@
 use anyhow::Result;
 use clap::Parser;
+use rerun::RecordingStream; // for rec.set_time_sequence(...)
+use std::collections::HashMap;
+use std::f64::consts::PI;
 
 mod urdf_logger;
 use urdf_logger::parse_and_log_urdf_hierarchy;
+
+// KREC crate: adjust your path/names if needed!
+use krec::KRec;
+use krec::KRecFrame;
+use urdf_rs::{Joint, Link, Robot};
+
+/// We'll replicate the Python "actuator_id => URDF joint" mapping:
+fn build_actuator_to_urdf_joint_map() -> HashMap<u32, &'static str> {
+    let mut map = HashMap::new();
+    // Left Arm
+    map.insert(11, "Revolute_2");
+    map.insert(12, "Revolute_4");
+    map.insert(13, "Revolute_5");
+    map.insert(14, "Revolute_8");
+    map.insert(15, "Revolute_16");
+    // Right Arm
+    map.insert(21, "Revolute_1");
+    map.insert(22, "Revolute_3");
+    map.insert(23, "Revolute_6");
+    map.insert(24, "Revolute_7");
+    map.insert(25, "Revolute_15");
+    // Left Leg
+    map.insert(31, "L_hip_y");
+    map.insert(32, "L_hip_x");
+    map.insert(33, "L_hip_z");
+    map.insert(34, "L_knee");
+    map.insert(35, "L_ankle_y");
+    // Right Leg
+    map.insert(41, "R_hip_y");
+    map.insert(42, "R_hip_x");
+    map.insert(43, "R_hip_z");
+    map.insert(44, "R_knee");
+    map.insert(45, "R_ankle_y");
+
+    map
+}
+
+/// A minimal 4x4 row-major transform builder that just rotates around Z by `angle_rad`.
+/// The rest is identity (no translation).
+fn build_z_rotation_4x4(angle_rad: f64) -> [f32; 16] {
+    let cz = angle_rad.cos() as f32;
+    let sz = angle_rad.sin() as f32;
+
+    [
+        cz,  -sz, 0.0, 0.0,
+        sz,   cz, 0.0, 0.0,
+        0.0,  0.0, 1.0, 0.0,
+        0.0,  0.0, 0.0, 1.0,
+    ]
+}
+
+/// Convert a 4x4 into (translation, 3x3) for logging as a `Transform3D`.
+fn decompose_4x4_to_translation_and_mat3x3(tf: [f32; 16]) -> ([f32; 3], [f32; 9]) {
+    let translation = [tf[3], tf[7], tf[11]];
+    let mat3x3 = [
+        tf[0], tf[1], tf[2],
+        tf[4], tf[5], tf[6],
+        tf[8], tf[9], tf[10],
+    ];
+    (translation, mat3x3)
+}
+
+/// Log basic scalar values for an actuator (like position, velocity, torque) if present.
+fn log_actuator_states(
+    rec: &RecordingStream,
+    frame_idx: usize,
+    actuator_id: u32,
+    position: Option<f64>,
+    velocity: Option<f64>,
+    torque: Option<f64>,
+) -> Result<()> {
+    // We'll associate these logs with the time-sequence = frame_idx
+    rec.set_time_sequence("frame_idx", frame_idx as i64);
+
+    // For example, store them under `actuators/actuator_<id>/state/...`
+    let base_path = format!("actuators/actuator_{}/state", actuator_id);
+
+    if let Some(pos) = position {
+        rec.log(
+            format!("{}/position", base_path),
+            &rerun::components::Scalar::from(pos),
+        )?;
+    }
+    if let Some(vel) = velocity {
+        rec.log(
+            format!("{}/velocity", base_path),
+            &rerun::components::Scalar::from(vel),
+        )?;
+    }
+    if let Some(tor) = torque {
+        rec.log(
+            format!("{}/torque", base_path),
+            &rerun::components::Scalar::from(tor),
+        )?;
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// BFS logic that replicates Python's `[0::2]` slicing for link-only paths
+// ----------------------------------------------------------------------------
+
+/// BFS adjacency: parent_link -> Vec<(joint_name, child_link_name)>
+fn build_adjacency(robot: &Robot) -> HashMap<String, Vec<(String, String)>> {
+    let mut adj = HashMap::new();
+    for j in &robot.joints {
+        let parent_link = j.parent.link.clone();
+        let child_link = j.child.link.clone();
+        adj.entry(parent_link)
+            .or_insert_with(Vec::new)
+            .push((j.name.clone(), child_link));
+    }
+    adj
+}
+
+/// BFS to produce a chain [link0, joint0, link1, joint1, link2,...] from `root_link` to `target_link`.
+fn bfs_build_chain(
+    robot: &Robot,
+    root_link: &str,
+    target_link: &str,
+) -> Option<Vec<String>> {
+    let adjacency = build_adjacency(robot);
+    use std::collections::VecDeque;
+
+    let mut queue = VecDeque::new();
+    queue.push_back((root_link.to_owned(), vec![root_link.to_owned()]));
+
+    while let Some((cur_link, path_so_far)) = queue.pop_front() {
+        if cur_link == target_link {
+            return Some(path_so_far);
+        }
+        if let Some(kids) = adjacency.get(&cur_link) {
+            for (joint_name, child_link) in kids {
+                let mut new_path = path_so_far.clone();
+                new_path.push(joint_name.clone());
+                new_path.push(child_link.clone());
+                queue.push_back((child_link.clone(), new_path));
+            }
+        }
+    }
+    None
+}
+
+/// Find root link by picking the link that is never a child.
+fn find_root_link(robot: &Robot) -> Option<String> {
+    use std::collections::HashSet;
+    let mut all_links = HashSet::new();
+    let mut child_links = HashSet::new();
+
+    for l in &robot.links {
+        all_links.insert(l.name.clone());
+    }
+    for j in &robot.joints {
+        child_links.insert(j.child.link.clone());
+    }
+    all_links.difference(&child_links).next().cloned()
+}
+
+/// Python-like `link_entity_path` => BFS from root -> link_name, keep only even indices (the links).
+fn link_entity_path(robot: &Robot, link_name: &str) -> Option<String> {
+    let root_link = find_root_link(robot)?;
+    let chain = bfs_build_chain(robot, &root_link, link_name)?;
+    // chain is e.g. [link0, joint0, link1, joint1, link2, ... link_name]
+    // Keep only even indices = link names
+    let link_only: Vec<_> = chain
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| if i % 2 == 0 { Some(name) } else { None })
+        .cloned()
+        .collect();
+    Some(link_only.join("/"))
+}
+
+/// Python-like `joint_entity_path` => BFS from root -> joint.child.link, keep only the link names (even indices).
+fn joint_entity_path(robot: &Robot, joint: &Joint) -> Option<String> {
+    let root_link = find_root_link(robot)?;
+    let chain = bfs_build_chain(robot, &root_link, &joint.child.link)?;
+    let link_only: Vec<_> = chain
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| if i % 2 == 0 { Some(name) } else { None })
+        .cloned()
+        .collect();
+    Some(link_only.join("/"))
+}
+
+// ----------------------------------------------------------------------------
+// Build map from joint_name -> BFS path
+// ----------------------------------------------------------------------------
+
+fn build_joint_name_to_entity_path(urdf_path: &str) -> Result<HashMap<String, String>> {
+    let robot_model = urdf_rs::read_file(urdf_path)?;
+
+    // For each joint, do a BFS to that joint's child, skipping joint names => path of links
+    let mut map = HashMap::new();
+    for j in &robot_model.joints {
+        if let Some(path) = joint_entity_path(&robot_model, j) {
+            map.insert(j.name.clone(), path);
+        }
+    }
+    Ok(map)
+}
+
+// ----------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(name = "rust_krecviz")]
@@ -10,26 +218,105 @@ struct Args {
     /// Path to the URDF file
     #[arg(long)]
     urdf: Option<String>,
+
+    /// Path to the KREC file
+    #[arg(long)]
+    krec: Option<String>,
+
+    /// Path to .rrd output (if you want to save)
+    #[arg(long)]
+    output: Option<String>,
 }
 
 fn main() -> Result<()> {
     // Show the parsed CLI args
     let args = dbg!(Args::parse());
 
-    // 1) Start a Rerun viewer
+    // 1) Start a Rerun recording
     let rec = dbg!(rerun::RecordingStreamBuilder::new("rust_krecviz_hierarchy_example"))
+        // If you want to save to a file, you could do:
+        //.save("my_animation.rrd")?  // or use `args.output`
+        // or spawn a viewer:
         .spawn()?;
 
-    // 2) If we have a URDF, parse & log it hierarchically
+    // 2) If we have a URDF, parse & log it hierarchically (this logs geometry + BFS transforms)
+    let mut joint_name_to_entity_path = HashMap::new();
     if let Some(urdf_path) = &args.urdf {
         dbg!(urdf_path);
         parse_and_log_urdf_hierarchy(urdf_path, &rec)?;
+
+        // Build the BFS-based map from each joint's name => "link-only" path
+        joint_name_to_entity_path = build_joint_name_to_entity_path(urdf_path)?;
     } else {
         dbg!("No URDF path provided, logging a fallback message.");
         rec.log("/urdf_info", &rerun::TextDocument::new("No URDF provided"))?;
     }
 
+    // 3) If we have a KREC, load it
+    if let Some(krec_path) = &args.krec {
+        dbg!(krec_path);
+        let loaded_krec = KRec::load(krec_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load KREC from {:?}: {:?}", krec_path, e))?;
+
+        // We'll replicate the python actuator->joint map
+        let actuator_map = build_actuator_to_urdf_joint_map();
+
+        // 4) Iterate frames
+        for (frame_idx, frame) in loaded_krec.frames.iter().enumerate() {
+            // Set Rerun time-sequence so transforms appear “animated”
+            rec.set_time_sequence("frame_idx", frame_idx as i64);
+
+            // 5) For each ActuatorState, look up the joint + log transform
+            for state in &frame.actuator_states {
+                let actuator_id = state.actuator_id;
+                if let Some(joint_name) = actuator_map.get(&actuator_id) {
+                    // BFS path that Python uses for that joint
+                    if let Some(entity_path) = joint_name_to_entity_path.get(*joint_name) {
+                        if let Some(pos_deg) = state.position {
+                            let angle_rad = pos_deg * (PI / 180.0);
+                            let tf4x4 = build_z_rotation_4x4(angle_rad);
+                            let (translation, mat3x3) = decompose_4x4_to_translation_and_mat3x3(tf4x4);
+
+                            // Debug prints to see what's being applied:
+                            println!(
+                                "[frame={}] actuator_id={} => joint='{}' => entity_path='{}'",
+                                frame_idx, actuator_id, joint_name, entity_path
+                            );
+                            println!(
+                                "  angle_deg={} => angle_rad={:.3} => transform_4x4={:?}",
+                                pos_deg, angle_rad, tf4x4
+                            );
+                            println!(
+                                "  => translation={:?}, mat3x3={:?}",
+                                translation, mat3x3
+                            );
+
+                            // Actually log the transform
+                            let tf = rerun::archetypes::Transform3D::from_translation(translation)
+                                .with_mat3x3(mat3x3);
+
+                            rec.log(entity_path.clone(), &tf)?;
+                        }
+                    }
+                }
+
+                // Optionally, log basic actuator states
+                log_actuator_states(
+                    &rec,
+                    frame_idx,
+                    actuator_id,
+                    state.position,
+                    state.velocity,
+                    state.torque,
+                )?;
+            }
+        }
+    } else {
+        dbg!("No KREC path provided, so no frame-by-frame animation is logged.");
+    }
+
     // Sleep so we can see the result in the viewer
     std::thread::sleep(std::time::Duration::from_secs(5));
+
     Ok(())
 }

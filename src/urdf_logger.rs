@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rerun::{
-    archetypes::{Mesh3D},
+    archetypes::{Mesh3D, Transform3D},
     components::{Blob as _, Blob, ImageBuffer, ImageFormat, Position3D, TriangleIndices},
     RecordingStream,
     TextDocument,
@@ -36,8 +36,8 @@ fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
 
     let r_x = [
         1.0, 0.0, 0.0,
-        0.0, cx,  -sx,
-        0.0, sx,   cx,
+        0.0, cx, -sx,
+        0.0, sx,  cx,
     ];
 
     let r_y = [
@@ -132,7 +132,71 @@ fn apply_4x4_to_mesh3d(mesh: &mut Mesh3D, transform: [f32; 16]) {
 }
 
 // ----------------------------------------------------------------------------
-// Adjacency + BFS to compute global transforms
+// Joint transform logging
+
+/// Convert a 4×4 row-major transform into translation + 3x3 for logging as `Transform3D`.
+fn decompose_4x4_to_translation_and_mat3x3(tf: [f32; 16]) -> ([f32; 3], [f32; 9]) {
+    let translation = [tf[3], tf[7], tf[11]];
+    let mat3x3 = [
+        tf[0], tf[1], tf[2],
+        tf[4], tf[5], tf[6],
+        tf[8], tf[9], tf[10],
+    ];
+    (translation, mat3x3)
+}
+
+/// A BFS-based path for the joint so we can do something like "root_link/joint_name/child_link" or similar.
+fn joint_entity_path(
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
+    root_link: &str,
+    joint: &Joint,
+) -> Option<String> {
+    // We'll find the BFS chain that leads from root_link to joint.child.link.
+    let target_link = &joint.child.link;
+
+    if let Some(chain) = get_chain(adjacency, root_link, target_link) {
+        // chain is [link0, joint0, link1, joint1, link2,...]
+        // We want to find the index of this joint in that BFS chain
+        let mut path_bits = Vec::new();
+        let mut idx = 0;
+        while idx < chain.len() {
+            if chain[idx] == joint.name {
+                // We found the joint in the chain
+                // Take all items up to that index in steps of 2 for link-names,
+                // then append the joint name
+                let sub_chain = &chain[..=idx]; 
+                let link_only: Vec<_> = sub_chain.iter().step_by(2).cloned().collect();
+                path_bits.extend(link_only);
+                path_bits.push(joint.name.clone());
+                return Some(path_bits.join("/"));
+            }
+            idx += 1;
+        }
+    }
+    None
+}
+
+/// Log a single joint's local transform as a `Transform3D`.
+fn log_joint_transform(
+    rec: &RecordingStream,
+    joint_path: &str,
+    local_tf_4x4: [f32; 16],
+) -> Result<()> {
+    let (translation, mat3x3) = decompose_4x4_to_translation_and_mat3x3(local_tf_4x4);
+    let tf = Transform3D::from_translation(translation).with_mat3x3(mat3x3);
+
+    println!("======================");
+    println!("rerun_log (Joint Transform)");
+    println!("entity_path = '{joint_path}'");
+    println!(" => translation={:?}, rotation={:?}", translation, mat3x3);
+    // Actually send to Rerun
+    rec.log(joint_path, &tf)?;
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Adjacency + BFS to compute global transforms AND log joint transforms
 
 /// Build adjacency: parent_link -> Vec<(joint, child_link)>
 fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(Joint, String)>> {
@@ -147,64 +211,7 @@ fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(Joint, String)>> {
     adj
 }
 
-/// Find the link that never appears as a child → typically the root.
-fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
-    let mut all_links = HashSet::new();
-    let mut child_links = HashSet::new();
-    for l in links {
-        all_links.insert(l.name.clone());
-    }
-    for j in joints {
-        child_links.insert(j.child.link.clone());
-    }
-    all_links.difference(&child_links).next().cloned()
-}
-
-/// For each link, compute its global transform from the root by chaining all the joint transforms.
-fn build_link_global_transforms(
-    adjacency: &HashMap<String, Vec<(Joint, String)>>,
-    root_link_name: &str,
-    joints: &[Joint],
-) -> HashMap<String, [f32; 16]> {
-    let mut link_to_tf = HashMap::new();
-
-    // The root link gets an identity transform
-    link_to_tf.insert(root_link_name.to_owned(), [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    ]);
-
-    // BFS queue: (current_link_name)
-    let mut queue = VecDeque::new();
-    queue.push_back(root_link_name.to_owned());
-
-    while let Some(cur_link) = queue.pop_front() {
-        let cur_tf = link_to_tf.get(&cur_link).cloned().unwrap();
-
-        if let Some(child_joints) = adjacency.get(&cur_link) {
-            for (j, child_link_name) in child_joints {
-                // Convert Vec3 to arrays for xyz and rpy
-                let xyz = [j.origin.xyz[0], j.origin.xyz[1], j.origin.xyz[2]];
-                let rpy = [j.origin.rpy[0], j.origin.rpy[1], j.origin.rpy[2]];
-                let local_tf = build_4x4_from_xyz_rpy(xyz, rpy);
-                let child_tf = mat4x4_mul(cur_tf, local_tf);
-                link_to_tf.insert(child_link_name.clone(), child_tf);
-
-                // Enqueue child
-                queue.push_back(child_link_name.clone());
-            }
-        }
-    }
-
-    link_to_tf
-}
-
-// ----------------------------------------------------------------------------
-// For building the BFS chain from root -> link to get entity path for logging
-
-/// BFS-based approach to gather [link0, joint0, link1, joint1, link2,…] to build a path string
+/// BFS-based approach to gather [link0, joint0, link1, joint1, link2,…] for paths.
 fn get_chain(
     adjacency: &HashMap<String, Vec<(Joint, String)>>,
     root_link: &str,
@@ -227,12 +234,80 @@ fn get_chain(
     None
 }
 
-/// Construct entity path for a link by skipping every-other item in BFS chain
+/// Find the link that never appears as a child → typically the root.
+fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
+    let mut all_links = HashSet::new();
+    let mut child_links = HashSet::new();
+    for l in links {
+        all_links.insert(l.name.clone());
+    }
+    for j in joints {
+        child_links.insert(j.child.link.clone());
+    }
+    all_links.difference(&child_links).next().cloned()
+}
+
+/// BFS to compute each link's global transform from the root **and** log each joint's transform.
+fn build_link_global_transforms_and_log_joints(
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
+    root_link_name: &str,
+    joints: &[Joint],
+    rec: &RecordingStream,
+) -> HashMap<String, [f32; 16]> {
+    let mut link_to_tf = HashMap::new();
+
+    // Root link at identity
+    link_to_tf.insert(
+        root_link_name.to_owned(),
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    );
+
+    let mut queue = VecDeque::new();
+    queue.push_back(root_link_name.to_owned());
+
+    while let Some(cur_link_name) = queue.pop_front() {
+        let cur_tf = link_to_tf.get(&cur_link_name).cloned().unwrap();
+
+        if let Some(child_joints) = adjacency.get(&cur_link_name) {
+            for (joint, child_link_name) in child_joints {
+                // (1) Build the joint's local transform
+                let xyz = [joint.origin.xyz[0], joint.origin.xyz[1], joint.origin.xyz[2]];
+                let rpy = [joint.origin.rpy[0], joint.origin.rpy[1], joint.origin.rpy[2]];
+                let local_tf_4x4 = build_4x4_from_xyz_rpy(xyz, rpy);
+
+                // (2) Log the joint transform
+                if let Some(joint_path) = joint_entity_path(adjacency, root_link_name, &joint) {
+                    let _ = log_joint_transform(rec, &joint_path, local_tf_4x4);
+                }
+
+                // (3) child_tf = cur_tf * local_tf
+                let child_tf = mat4x4_mul(cur_tf, local_tf_4x4);
+                link_to_tf.insert(child_link_name.clone(), child_tf);
+
+                // push child
+                queue.push_back(child_link_name.clone());
+            }
+        }
+    }
+
+    link_to_tf
+}
+
+// ----------------------------------------------------------------------------
+// For building the BFS chain from root -> link to get entity path for logging
+
 fn link_entity_path(
     adjacency: &HashMap<String, Vec<(Joint, String)>>,
     root_link: &str,
     link_name: &str,
 ) -> Option<String> {
+    // BFS chain = [link0, joint0, link1, joint1, ...]
+    // We skip every-other item (the joint names) to build a path from the link names.
     if let Some(chain) = get_chain(adjacency, root_link, link_name) {
         let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
         Some(link_names.join("/"))
@@ -246,9 +321,7 @@ fn link_entity_path(
 
 /// Load .stl into a Mesh3D
 fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
-    let f = OpenOptions::new()
-        .read(true)
-        .open(abs_path)
+    let f = OpenOptions::new().read(true).open(abs_path)
         .map_err(|e| anyhow::anyhow!("Failed to open {abs_path:?}: {e}"))?;
     let mut buf = BufReader::new(f);
     let stl = stl_io::read_stl(&mut buf)
@@ -325,7 +398,7 @@ fn load_image_as_rerun_buffer(path: &Path) -> Result<rerun::components::ImageBuf
 /// For each link.visual:
 ///  1) Retrieve that link's global transform from BFS map (`link_global_tf`).
 ///  2) Build local visual transform from <origin xyz rpy>.
-///  3) final_tf = link_global_tf * local_visual_tf
+///  3) final_tf = link_global_tf * local_tf
 ///  4) apply final_tf to the mesh
 ///  5) log
 fn log_link_with_global_transform(
@@ -496,6 +569,7 @@ fn log_link_with_global_transform(
         println!("rerun_log");
         println!("entity_path = '{}'", mesh_entity_path);
         println!(" => geometry has {} vertices", mesh3d.vertex_positions.len());
+        // Actually log
         rec.log(mesh_entity_path.as_str(), &mesh3d)?;
     }
 
@@ -510,7 +584,7 @@ fn log_link_with_global_transform(
 }
 
 // ----------------------------------------------------------------------------
-// Main entry point: parse URDF, BFS to build global link transforms, then log
+// Main entry point: parse URDF, BFS to build global link transforms, THEN log
 
 pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> Result<()> {
     // Parse URDF
@@ -524,8 +598,13 @@ pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> R
     let root_link_name = find_root_link_name(&robot_model.links, &robot_model.joints)
         .unwrap_or_else(|| "base".to_owned());
 
-    // Build a map link_name -> [f32;16] for each link's global transform
-    let link_global_tf_map = build_link_global_transforms(&adjacency, &root_link_name, &robot_model.joints);
+    // Build link transforms AND LOG each joint transform
+    let link_global_tf_map = build_link_global_transforms_and_log_joints(
+        &adjacency,
+        &root_link_name,
+        &robot_model.joints,
+        rec,
+    );
 
     // Collect global named materials
     let mut all_materials_map = HashMap::new();
@@ -533,7 +612,7 @@ pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> R
         all_materials_map.insert(m.name.clone(), m);
     }
 
-    // (A) Just log the root as a “view coordinates” or something similar
+    // (A) Log the root as a pretend “view coordinates”
     println!("======================");
     println!("rerun_log");
     println!("entity_path = '' (root path)");
@@ -546,7 +625,7 @@ pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> R
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // We’ll still gather link references in a map for direct access
+    // Gather link references in a map for direct access
     let mut link_map: HashMap<String, &Link> = HashMap::new();
     for l in &robot_model.links {
         link_map.insert(l.name.clone(), l);
