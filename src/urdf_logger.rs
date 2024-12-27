@@ -2,19 +2,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::fs;
 
 use anyhow::Result;
+use image; // for loading actual images
+use nalgebra as na;
+use parry3d::shape::{Ball as ParrySphere, Cuboid as ParryCuboid, Cylinder as ParryCylinder};
 use rerun::{
     archetypes::{Mesh3D, Transform3D},
-    components::{Blob as _, Blob, ImageBuffer, ImageFormat, Position3D, TriangleIndices},
+    components::{ImageBuffer, ImageFormat, Position3D, TriangleIndices, Vector3D},
     RecordingStream,
     TextDocument,
+    ViewCoordinates,
 };
-use urdf_rs::{self, Color, Geometry, Joint, Link, Material, Pose};
-
-use nalgebra as na;
-use parry3d::shape::{Ball as ParrySphere, Cuboid, Cylinder as ParryCylinder};
-use image; // for loading actual images
+use urdf_rs::{self, Geometry, Joint, Link, Material};
 
 /// Minimal info (color & texture path) from a URDF Material.
 #[derive(Default, Debug)]
@@ -28,7 +29,6 @@ struct RrMaterialInfo {
 // ----------------------------------------------------------------------------
 // Utilities for 3×3 & 4×4 transforms
 
-/// Convert Euler angles (rx, ry, rz) to row-major 3x3 rotation matrix: final_mat = Rz * Ry * Rx.
 fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
     let (cx, sx) = (rx.cos() as f32, rx.sin() as f32);
     let (cy, sy) = (ry.cos() as f32, ry.sin() as f32);
@@ -56,21 +56,19 @@ fn rotation_from_euler_xyz(rx: f64, ry: f64, rz: f64) -> [f32; 9] {
     mat3x3_mul(r_z, ryx)
 }
 
-/// Multiply two row-major 3x3 matrices (a*b).
 fn mat3x3_mul(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
     let mut out = [0.0; 9];
     for row in 0..3 {
         for col in 0..3 {
             out[row * 3 + col] =
-                a[row * 3 + 0] * b[col + 0] +
-                a[row * 3 + 1] * b[col + 3] +
-                a[row * 3 + 2] * b[col + 6];
+                a[row * 3 + 0] * b[col + 0]
+                + a[row * 3 + 1] * b[col + 3]
+                + a[row * 3 + 2] * b[col + 6];
         }
     }
     out
 }
 
-/// Build a row-major 4x4 transform from xyz + rpy (Euler angles).
 fn build_4x4_from_xyz_rpy(xyz: [f64; 3], rpy: [f64; 3]) -> [f32; 16] {
     let rot3x3 = rotation_from_euler_xyz(rpy[0], rpy[1], rpy[2]);
     [
@@ -81,7 +79,6 @@ fn build_4x4_from_xyz_rpy(xyz: [f64; 3], rpy: [f64; 3]) -> [f32; 16] {
     ]
 }
 
-/// Multiply two row-major 4x4 matrices (a*b).
 fn mat4x4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
     let mut out = [0.0; 16];
     for row in 0..4 {
@@ -96,45 +93,6 @@ fn mat4x4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
     out
 }
 
-// ----------------------------------------------------------------------------
-// Baked transform for a Mesh3D
-
-/// Like Python `mesh.apply_transform(transform)`, applying a 4x4 in row-major to vertex positions (and normals).
-fn apply_4x4_to_mesh3d(mesh: &mut Mesh3D, transform: [f32; 16]) {
-    // Positions: treat as (x,y,z,1)
-    for vertex in &mut mesh.vertex_positions {
-        let x = vertex[0];
-        let y = vertex[1];
-        let z = vertex[2];
-        let w = 1.0;
-        let xp = transform[0] * x + transform[1] * y + transform[2] * z + transform[3] * w;
-        let yp = transform[4] * x + transform[5] * y + transform[6] * z + transform[7] * w;
-        let zp = transform[8] * x + transform[9] * y + transform[10] * z + transform[11] * w;
-        vertex[0] = xp;
-        vertex[1] = yp;
-        vertex[2] = zp;
-    }
-    // Normals: treat as (nx, ny, nz, 0) (no translation)
-    if let Some(ref mut normals) = mesh.vertex_normals {
-        for normal in normals {
-            let nx = normal[0];
-            let ny = normal[1];
-            let nz = normal[2];
-            let w = 0.0;
-            let nxp = transform[0] * nx + transform[1] * ny + transform[2] * nz + transform[3] * w;
-            let nyp = transform[4] * nx + transform[5] * ny + transform[6] * nz + transform[7] * w;
-            let nzp = transform[8] * nx + transform[9] * ny + transform[10] * nz + transform[11] * w;
-            normal[0] = nxp;
-            normal[1] = nyp;
-            normal[2] = nzp;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Joint transform logging
-
-/// Convert a 4×4 row-major transform into translation + 3x3 for logging as `Transform3D`.
 fn decompose_4x4_to_translation_and_mat3x3(tf: [f32; 16]) -> ([f32; 3], [f32; 9]) {
     let translation = [tf[3], tf[7], tf[11]];
     let mat3x3 = [
@@ -145,96 +103,182 @@ fn decompose_4x4_to_translation_and_mat3x3(tf: [f32; 16]) -> ([f32; 3], [f32; 9]
     (translation, mat3x3)
 }
 
-/// A BFS-based path for the joint so we can do something like "root_link/joint_name/child_link" or similar.
-fn joint_entity_path(
-    adjacency: &HashMap<String, Vec<(Joint, String)>>,
-    root_link: &str,
-    joint: &Joint,
-) -> Option<String> {
-    // We'll find the BFS chain that leads from root_link to joint.child.link.
-    let target_link = &joint.child.link;
+// ----------------------------------------------------------------------------
+// Normal computation helpers:
 
-    if let Some(chain) = get_chain(adjacency, root_link, target_link) {
-        // chain is [link0, joint0, link1, joint1, link2,...]
-        // We want to find the index of this joint in that BFS chain
-        let mut path_bits = Vec::new();
-        let mut idx = 0;
-        while idx < chain.len() {
-            if chain[idx] == joint.name {
-                // We found the joint in the chain
-                // Take all items up to that index in steps of 2 for link-names,
-                // then append the joint name
-                let sub_chain = &chain[..=idx]; 
-                let link_only: Vec<_> = sub_chain.iter().step_by(2).cloned().collect();
-                path_bits.extend(link_only);
-                path_bits.push(joint.name.clone());
-                return Some(path_bits.join("/"));
-            }
-            idx += 1;
-        }
-    }
-    None
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    ]
 }
 
-/// Log a single joint's local transform as a `Transform3D`.
-fn log_joint_transform(
-    rec: &RecordingStream,
-    joint_path: &str,
-    local_tf_4x4: [f32; 16],
-) -> Result<()> {
-    let (translation, mat3x3) = decompose_4x4_to_translation_and_mat3x3(local_tf_4x4);
-    let tf = Transform3D::from_translation(translation).with_mat3x3(mat3x3);
+fn length(v: [f32; 3]) -> f32 {
+    (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()
+}
 
-    println!("======================");
-    println!("rerun_log (Joint Transform)");
-    println!("entity_path = '{joint_path}'");
-    println!(" => translation={:?}, rotation={:?}", translation, mat3x3);
-    // Actually send to Rerun
-    rec.log(joint_path, &tf)?;
+/// Compute per-vertex normals by accumulating face normals, then normalizing.
+fn compute_vertex_normals(mesh: &mut Mesh3D) {
+    let n_verts = mesh.vertex_positions.len();
+    if n_verts == 0 {
+        // no geometry
+        mesh.vertex_normals = None;
+        return;
+    }
 
-    Ok(())
+    // We'll store accumulative normals (area-weighted, by face cross).
+    let mut accum = vec!([0.0_f32; 3]; n_verts);
+
+    // If we have no triangles, do nothing:
+    let Some(tris) = &mesh.triangle_indices else {
+        mesh.vertex_normals = None;
+        return;
+    };
+
+    // accumulate face normals
+    for t in tris {
+        let i0 = t[0] as usize;
+        let i1 = t[1] as usize;
+        let i2 = t[2] as usize;
+        if i0 >= n_verts || i1 >= n_verts || i2 >= n_verts {
+            continue; // out-of-bounds
+        }
+
+        let p0 = mesh.vertex_positions[i0];
+        let p1 = mesh.vertex_positions[i1];
+        let p2 = mesh.vertex_positions[i2];
+        let v10 = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
+        let v20 = [p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]];
+
+        // Face normal (un-normalized):
+        let face_n = cross(v10, v20);
+
+        // Add to each vertex's accum:
+        for idx in [i0, i1, i2] {
+            accum[idx][0] += face_n[0];
+            accum[idx][1] += face_n[1];
+            accum[idx][2] += face_n[2];
+        }
+    }
+
+    // Normalize each vertex normal
+    let mut final_normals = Vec::with_capacity(n_verts);
+    for acc in accum {
+        let len = length(acc);
+        if len > 1e-12 {
+            final_normals.push(Vector3D::from([
+                acc[0]/len,
+                acc[1]/len,
+                acc[2]/len,
+            ]));
+        } else {
+            // fallback
+            final_normals.push(Vector3D::from([0.0, 1.0, 0.0]));
+        }
+    }
+
+    mesh.vertex_normals = Some(final_normals);
 }
 
 // ----------------------------------------------------------------------------
-// Adjacency + BFS to compute global transforms AND log joint transforms
+// Baked transform for a Mesh3D
 
-/// Build adjacency: parent_link -> Vec<(joint, child_link)>
+fn apply_4x4_to_mesh3d(mesh: &mut Mesh3D, tf: [f32; 16]) {
+    // Positions
+    for v in &mut mesh.vertex_positions {
+        let (x, y, z, w) = (v[0], v[1], v[2], 1.0);
+        let xp = tf[0]*x + tf[1]*y + tf[2]*z + tf[3]*w;
+        let yp = tf[4]*x + tf[5]*y + tf[6]*z + tf[7]*w;
+        let zp = tf[8]*x + tf[9]*y + tf[10]*z + tf[11]*w;
+        v[0] = xp; 
+        v[1] = yp; 
+        v[2] = zp;
+    }
+    // Normals
+    if let Some(ref mut normals) = mesh.vertex_normals {
+        for n in normals {
+            let (nx, ny, nz, w) = (n[0], n[1], n[2], 0.0);
+            let nxp = tf[0]*nx + tf[1]*ny + tf[2]*nz + tf[3]*w;
+            let nyp = tf[4]*nx + tf[5]*ny + tf[6]*nz + tf[7]*w;
+            let nzp = tf[8]*nx + tf[9]*ny + tf[10]*nz + tf[11]*w;
+            n[0] = nxp; 
+            n[1] = nyp; 
+            n[2] = nzp;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Load STL helper
+fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
+    println!("Loading STL file: {:?}", abs_path);
+    let f = OpenOptions::new().read(true).open(abs_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open {abs_path:?}: {e}"))?;
+    let mut buf = BufReader::new(f);
+    let ext_lower = abs_path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+    if ext_lower.as_deref() == Some("stl") {
+        match stl_io::read_stl(&mut buf) {
+            Ok(stl) => {
+                let positions: Vec<Position3D> = stl
+                    .vertices
+                    .iter()
+                    .map(|v| Position3D::from([v[0], v[1], v[2]]))
+                    .collect();
+                let indices: Vec<TriangleIndices> = stl
+                    .faces
+                    .iter()
+                    .map(|face| {
+                        TriangleIndices::from([
+                            face.vertices[0] as u32,
+                            face.vertices[1] as u32,
+                            face.vertices[2] as u32,
+                        ])
+                    })
+                    .collect();
+
+                // Build a Mesh3D
+                let mut mesh = Mesh3D::new(positions).with_triangle_indices(indices);
+
+                // Now compute normals manually
+                compute_vertex_normals(&mut mesh);
+
+                // // ---------------------- ADD THIS BLOCK ----------------------
+                // // Bake in the "fix" transform to correct orientation:
+                // // roll = +90°, pitch = 0°, yaw = +180°
+                // let fix_tf_4x4 = build_4x4_from_xyz_rpy(
+                //     [0.0, 0.0, 0.0], 
+                //     [std::f64::consts::FRAC_PI_2, 0.0, std::f64::consts::PI]
+                // );
+                // apply_4x4_to_mesh3d(&mut mesh, fix_tf_4x4);
+                // // -----------------------------------------------------------
+
+
+                mesh.sanity_check()?;
+                Ok(mesh)
+            }
+            Err(e) => Err(anyhow::anyhow!("stl_io error reading {abs_path:?}: {e}")),
+        }
+    } else {
+        Err(anyhow::anyhow!("Currently only .stl handled"))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// BFS adjacency + root link detection
+
 fn build_adjacency(joints: &[Joint]) -> HashMap<String, Vec<(Joint, String)>> {
     let mut adj = HashMap::new();
     for j in joints {
-        let parent_link_name = j.parent.link.clone();
-        let child_link_name = j.child.link.clone();
-        adj.entry(parent_link_name)
-            .or_insert_with(Vec::new)
-            .push((j.clone(), child_link_name));
+        let p = j.parent.link.clone();
+        let c = j.child.link.clone();
+        adj.entry(p).or_insert_with(Vec::new).push((j.clone(), c));
     }
     adj
 }
 
-/// BFS-based approach to gather [link0, joint0, link1, joint1, link2,…] for paths.
-fn get_chain(
-    adjacency: &HashMap<String, Vec<(Joint, String)>>,
-    root_link: &str,
-    target_link: &str,
-) -> Option<Vec<String>> {
-    let mut stack = vec![(root_link.to_owned(), vec![root_link.to_owned()])];
-    while let Some((cur_link, path_so_far)) = stack.pop() {
-        if cur_link == target_link {
-            return Some(path_so_far);
-        }
-        if let Some(children) = adjacency.get(&cur_link) {
-            for (joint, child_link) in children {
-                let mut new_path = path_so_far.clone();
-                new_path.push(joint.name.clone());
-                new_path.push(child_link.clone());
-                stack.push((child_link.clone(), new_path));
-            }
-        }
-    }
-    None
-}
-
-/// Find the link that never appears as a child → typically the root.
 fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
     let mut all_links = HashSet::new();
     let mut child_links = HashSet::new();
@@ -247,303 +291,183 @@ fn find_root_link_name(links: &[Link], joints: &[Joint]) -> Option<String> {
     all_links.difference(&child_links).next().cloned()
 }
 
-/// BFS to compute each link's global transform from the root **and** log each joint's transform.
-fn build_link_global_transforms_and_log_joints(
+fn get_link_chain(
     adjacency: &HashMap<String, Vec<(Joint, String)>>,
-    root_link_name: &str,
-    joints: &[Joint],
-    rec: &RecordingStream,
-) -> HashMap<String, [f32; 16]> {
-    let mut link_to_tf = HashMap::new();
-
-    // Root link at identity
-    link_to_tf.insert(
-        root_link_name.to_owned(),
-        [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ],
-    );
-
+    root_link: &str,
+    target: &str,
+) -> Option<Vec<String>> {
     let mut queue = VecDeque::new();
-    queue.push_back(root_link_name.to_owned());
+    queue.push_back((root_link.to_owned(), vec![root_link.to_owned()]));
 
-    while let Some(cur_link_name) = queue.pop_front() {
-        let cur_tf = link_to_tf.get(&cur_link_name).cloned().unwrap();
-
-        if let Some(child_joints) = adjacency.get(&cur_link_name) {
-            for (joint, child_link_name) in child_joints {
-                // (1) Build the joint's local transform
-                let xyz = [joint.origin.xyz[0], joint.origin.xyz[1], joint.origin.xyz[2]];
-                let rpy = [joint.origin.rpy[0], joint.origin.rpy[1], joint.origin.rpy[2]];
-                let local_tf_4x4 = build_4x4_from_xyz_rpy(xyz, rpy);
-
-                // (2) Log the joint transform
-                if let Some(joint_path) = joint_entity_path(adjacency, root_link_name, &joint) {
-                    let _ = log_joint_transform(rec, &joint_path, local_tf_4x4);
-                }
-
-                // (3) child_tf = cur_tf * local_tf
-                let child_tf = mat4x4_mul(cur_tf, local_tf_4x4);
-                link_to_tf.insert(child_link_name.clone(), child_tf);
-
-                // push child
-                queue.push_back(child_link_name.clone());
+    while let Some((cur_link, path_so_far)) = queue.pop_front() {
+        if cur_link == target {
+            return Some(path_so_far);
+        }
+        if let Some(kids) = adjacency.get(&cur_link) {
+            for (j, c) in kids {
+                let mut new_path = path_so_far.clone();
+                new_path.push(j.name.clone());
+                new_path.push(c.clone());
+                queue.push_back((c.clone(), new_path));
             }
         }
     }
-
-    link_to_tf
+    None
 }
-
-// ----------------------------------------------------------------------------
-// For building the BFS chain from root -> link to get entity path for logging
 
 fn link_entity_path(
     adjacency: &HashMap<String, Vec<(Joint, String)>>,
     root_link: &str,
     link_name: &str,
 ) -> Option<String> {
-    // BFS chain = [link0, joint0, link1, joint1, ...]
-    // We skip every-other item (the joint names) to build a path from the link names.
-    if let Some(chain) = get_chain(adjacency, root_link, link_name) {
-        let link_names: Vec<_> = chain.iter().step_by(2).cloned().collect();
-        Some(link_names.join("/"))
+    if let Some(chain) = get_link_chain(adjacency, root_link, link_name) {
+        let link_only: Vec<_> = chain
+            .iter()
+            .enumerate()
+            .filter_map(|(i, nm)| if i % 2 == 0 { Some(nm.clone()) } else { None })
+            .collect();
+        Some(link_only.join("/"))
     } else {
         None
     }
 }
 
 // ----------------------------------------------------------------------------
-// Loading geometry + materials
-
-/// Load .stl into a Mesh3D
-fn load_stl_as_mesh3d(abs_path: &Path) -> Result<Mesh3D> {
-    let f = OpenOptions::new().read(true).open(abs_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open {abs_path:?}: {e}"))?;
-    let mut buf = BufReader::new(f);
-    let stl = stl_io::read_stl(&mut buf)
-        .map_err(|e| anyhow::anyhow!("stl_io error reading {abs_path:?}: {e}"))?;
-
-    let positions: Vec<Position3D> = stl
-        .vertices
-        .iter()
-        .map(|v| Position3D::from([v[0], v[1], v[2]]))
-        .collect();
-    let indices: Vec<TriangleIndices> = stl
-        .faces
-        .iter()
-        .map(|face| {
-            TriangleIndices::from([
-                face.vertices[0] as u32,
-                face.vertices[1] as u32,
-                face.vertices[2] as u32,
-            ])
-        })
-        .collect();
-
-    let mesh = Mesh3D::new(positions).with_triangle_indices(indices);
-    mesh.sanity_check()?;
-    Ok(mesh)
-}
-
-/// Parse color/texture from a URDF <material>
-fn parse_urdf_material(mat: &Material, urdf_dir: &Path) -> RrMaterialInfo {
-    let mut info = RrMaterialInfo::default();
-    // If <color> is present
-    if let Some(c) = &mat.color {
-        let rgba = &*c.rgba; // [f64; 4]
-        info.color_rgba = Some([
-            rgba[0] as f32,
-            rgba[1] as f32,
-            rgba[2] as f32,
-            rgba[3] as f32,
-        ]);
-    }
-    // If <texture> is present
-    if let Some(tex) = &mat.texture {
-        let abs = urdf_dir.join(&tex.filename);
-        if abs.exists() {
-            info.texture_path = Some(abs);
-        }
-    }
-    info
-}
-
-/// Convert float RGBA -> u8 RGBA in [0..255]
-fn float_rgba_to_u8(rgba: [f32; 4]) -> [u8; 4] {
-    [
-        (rgba[0] * 255.0).clamp(0.0, 255.0) as u8,
-        (rgba[1] * 255.0).clamp(0.0, 255.0) as u8,
-        (rgba[2] * 255.0).clamp(0.0, 255.0) as u8,
-        (rgba[3] * 255.0).clamp(0.0, 255.0) as u8,
-    ]
-}
-
-/// Load an image from disk → Rerun ImageBuffer
-fn load_image_as_rerun_buffer(path: &Path) -> Result<rerun::components::ImageBuffer> {
-    let img = image::open(path)
-        .map_err(|e| anyhow::anyhow!("Failed to open {path:?}: {e}"))?;
-    let rgba8 = img.to_rgba8().into_raw(); // Vec<u8>
-    let data_blob: rerun::datatypes::Blob = rgba8.into();
-    let image_buf = ImageBuffer(data_blob);
-    Ok(image_buf)
-}
-
-// ----------------------------------------------------------------------------
-// Logging each link's geometry: now with global transform
-
-/// For each link.visual:
-///  1) Retrieve that link's global transform from BFS map (`link_global_tf`).
-///  2) Build local visual transform from <origin xyz rpy>.
-///  3) final_tf = link_global_tf * local_tf
-///  4) apply final_tf to the mesh
-///  5) log
-fn log_link_with_global_transform(
+// Stage1: log geometry at identity
+fn log_link_meshes_at_identity(
     link: &Link,
-    link_global_tf: [f32; 16],
     entity_path: &str,
-    urdf_dir: &PathBuf,
-    all_materials_map: &HashMap<String, &Material>,
+    urdf_dir: &Path,
+    all_mat_map: &HashMap<String, &Material>,
     rec: &RecordingStream,
 ) -> Result<()> {
-    let mut doc_text = format!("Hierarchical URDF Link: {}\n", link.name);
+    let mut doc_text = format!("Link at IDENTITY: {}\n", link.name);
 
-    // Inertial summary
-    let inertial = &link.inertial;
-    doc_text.push_str(&format!("  Inertial mass: {}\n", inertial.mass.value));
-    doc_text.push_str(&format!(
-        "  Inertia ixx={} iyy={} izz={} ixy={} ixz={} iyz={}\n",
-        inertial.inertia.ixx,
-        inertial.inertia.iyy,
-        inertial.inertia.izz,
-        inertial.inertia.ixy,
-        inertial.inertia.ixz,
-        inertial.inertia.iyz
-    ));
-    doc_text.push_str(&format!(
-        "  inertial origin xyz={:?}, rpy={:?}\n",
-        inertial.origin.xyz, inertial.origin.rpy
-    ));
-
-    if link.visual.is_empty() {
-        doc_text.push_str("  (No visual geometry)\n");
-    } else {
-        doc_text.push_str("  Visual geometry:\n");
-    }
-
-    // Each visual
     for (i, vis) in link.visual.iter().enumerate() {
-        doc_text.push_str(&format!(
-            "    #{} origin xyz={:?}, rpy={:?}\n",
-            i, vis.origin.xyz, vis.origin.rpy
-        ));
+        let mesh_entity_path = format!("{}/visual_{}", entity_path, i);
 
-        // (1) gather material info
+        // parse material
         let mut mat_info = RrMaterialInfo::default();
-        if let Some(vis_mat) = &vis.material {
-            let mat_name = &vis_mat.name;
-            // If color/texture is None, assume named reference
-            if vis_mat.color.is_none() && vis_mat.texture.is_none() {
-                if let Some(global_mat) = all_materials_map.get(mat_name) {
+        if let Some(m) = &vis.material {
+            if m.color.is_none() && m.texture.is_none() {
+                if let Some(global_mat) = all_mat_map.get(&m.name) {
                     mat_info = parse_urdf_material(global_mat, urdf_dir);
                 }
             } else {
-                mat_info = parse_urdf_material(vis_mat, urdf_dir);
+                mat_info = parse_urdf_material(m, urdf_dir);
             }
         }
 
-        // (2) build geometry
-        let mesh_entity_path = format!("{}/visual_{}", entity_path, i);
-        let (mut mesh3d, extra_txt) = match &vis.geometry {
+        // Build geometry info
+        let (mut mesh3d, info_txt) = match &vis.geometry {
             Geometry::Mesh { filename, scale } => {
-                let abs_path = urdf_dir.join(filename);
-                let mut txt = format!("      Mesh file={:?}, scale={scale:?}\n", abs_path);
-                if abs_path.extension().and_then(|e| e.to_str()) == Some("stl") {
+                let joined = urdf_dir.join(filename);
+                // canonicalize will remove things like "../"
+                let abs_path = match fs::canonicalize(&joined) {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        // If canonicalize fails (e.g. file not found), 
+                        // use joined as fallback
+                        joined
+                    }
+                };
+                println!("Mesh absolute path: {:?}", abs_path.display());
+                let mut info_txt = format!("Mesh file={:?}, scale={:?}\n", abs_path, scale);
+                if abs_path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .as_deref() == Some("stl") 
+                {
                     match load_stl_as_mesh3d(&abs_path) {
-                        Ok(m) => (m, txt),
+                        Ok(m) => (m, info_txt),
                         Err(e) => {
-                            txt.push_str(&format!("(Error loading STL: {e})\n"));
-                            (Mesh3D::new(Vec::<[f32; 3]>::new()), txt)
+                            info_txt.push_str(&format!("(Error loading STL: {e})\n"));
+                            (Mesh3D::new(Vec::<[f32; 3]>::new()), info_txt)
                         }
                     }
                 } else {
-                    txt.push_str("      (Currently only .stl is handled)\n");
-                    (Mesh3D::new(Vec::<[f32; 3]>::new()), txt)
+                    info_txt.push_str("(Currently only .stl handled)\n");
+                    (Mesh3D::new(Vec::<[f32;3]>::new()), info_txt)
                 }
             }
             Geometry::Box { size } => {
                 let (sx, sy, sz) = (size[0], size[1], size[2]);
-                let msg = format!("      Box size=({},{},{})\n", sx, sy, sz);
-                let cuboid = Cuboid::new(na::Vector3::new(
-                    (sx / 2.0) as f32,
-                    (sy / 2.0) as f32,
-                    (sz / 2.0) as f32,
+                let info_txt = format!("Box size=({},{},{})\n", sx, sy, sz);
+                let cuboid = ParryCuboid::new(na::Vector3::new(
+                    (sx/2.0) as f32,
+                    (sy/2.0) as f32,
+                    (sz/2.0) as f32,
                 ));
                 let (raw_v, raw_i) = cuboid.to_trimesh();
-                let positions: Vec<Position3D> = raw_v
-                    .iter()
-                    .map(|p| Position3D::from([p.x, p.y, p.z]))
-                    .collect();
-                let tri_idxs: Vec<TriangleIndices> = raw_i
-                    .iter()
-                    .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
-                    .collect();
-                let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
-                (mesh, msg)
+                // Convert them to Mesh3D
+                let positions: Vec<Position3D> = raw_v.iter().map(|p| Position3D::from([p.x, p.y, p.z])).collect();
+                let indices: Vec<TriangleIndices> = raw_i.iter().map(|[a,b,c]| TriangleIndices::from([*a,*b,*c])).collect();
+                let mut mesh = Mesh3D::new(positions).with_triangle_indices(indices);
+
+                // compute normals
+                compute_vertex_normals(&mut mesh);
+
+                (mesh, info_txt)
             }
             Geometry::Cylinder { radius, length } => {
-                let msg = format!("      Cylinder radius={}, length={}\n", radius, length);
-                let half_height = (*length as f32) / 2.0;
-                let cyl = ParryCylinder::new(half_height, *radius as f32);
+                let info_txt = format!("Cylinder r={}, length={}\n", radius, length);
+                let half = (*length as f32)/2.0;
+                let cyl = ParryCylinder::new(half, *radius as f32);
                 let (raw_v, raw_i) = cyl.to_trimesh(30);
                 let positions: Vec<Position3D> = raw_v
                     .iter()
                     .map(|p| Position3D::from([p.x, p.y, p.z]))
                     .collect();
-                let tri_idxs: Vec<TriangleIndices> = raw_i
+                let indices: Vec<TriangleIndices> = raw_i
                     .iter()
                     .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
                     .collect();
-                let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
-                (mesh, msg)
+                let mut mesh = Mesh3D::new(positions).with_triangle_indices(indices);
+
+                // pre-rotate so cylinder axis is +Z
+                let rotate_x_90 = build_4x4_from_xyz_rpy([0.0, 0.0, 0.0], [-std::f64::consts::FRAC_PI_2, 0.0, 0.0]);
+                apply_4x4_to_mesh3d(&mut mesh, rotate_x_90);
+
+                // now compute normals
+                compute_vertex_normals(&mut mesh);
+
+                (mesh, info_txt)
             }
             Geometry::Sphere { radius } => {
-                let msg = format!("      Sphere radius={}\n", radius);
+                let info_txt = format!("Sphere radius={}\n", radius);
                 let ball = ParrySphere::new(*radius as f32);
                 let (raw_v, raw_i) = ball.to_trimesh(20, 20);
                 let positions: Vec<Position3D> = raw_v
                     .iter()
                     .map(|p| Position3D::from([p.x, p.y, p.z]))
                     .collect();
-                let tri_idxs: Vec<TriangleIndices> = raw_i
+                let indices: Vec<TriangleIndices> = raw_i
                     .iter()
                     .map(|[a,b,c]| TriangleIndices::from([*a,*b,*c]))
                     .collect();
-                let mesh = Mesh3D::new(positions).with_triangle_indices(tri_idxs);
-                (mesh, msg)
+                let mut mesh = Mesh3D::new(positions).with_triangle_indices(indices);
+
+                // compute normals
+                compute_vertex_normals(&mut mesh);
+
+                (mesh, info_txt)
             }
             _ => {
-                let msg = String::from("      (Unsupported geometry)\n");
-                (Mesh3D::new(Vec::<[f32; 3]>::new()), msg)
+                let info_txt = String::from("(Unsupported geometry)\n");
+                (Mesh3D::new(Vec::<[f32;3]>::new()), info_txt)
             }
         };
-        doc_text.push_str(&extra_txt);
 
-        // (3) Build the local visual transform
-        let xyz = [vis.origin.xyz[0], vis.origin.xyz[1], vis.origin.xyz[2]];
-        let rpy = [vis.origin.rpy[0], vis.origin.rpy[1], vis.origin.rpy[2]];
-        let local_tf = build_4x4_from_xyz_rpy(xyz, rpy);
+        doc_text.push_str(&format!("Visual #{} => {}\n", i, info_txt));
 
-        // (4) final_tf = link_global_tf * local_tf
-        let final_tf = mat4x4_mul(link_global_tf, local_tf);
+        // Transform the geometry by the local visual.origin:
+        let origin = &vis.origin;
+        let xyz = [origin.xyz[0], origin.xyz[1], origin.xyz[2]];
+        let rpy = [origin.rpy[0], origin.rpy[1], origin.rpy[2]];
+        let local_tf_4x4 = build_4x4_from_xyz_rpy(xyz, rpy);
+        apply_4x4_to_mesh3d(&mut mesh3d, local_tf_4x4);
 
-        // (5) Bake transform
-        apply_4x4_to_mesh3d(&mut mesh3d, final_tf);
-
-        // (6) Apply color/texture
+        // optional color
         if let Some(rgba) = mat_info.color_rgba {
             let col_u8 = float_rgba_to_u8(rgba);
             let n_verts = mesh3d.vertex_positions.len();
@@ -556,112 +480,258 @@ fn log_link_with_global_transform(
         if let Some(tex_path) = &mat_info.texture_path {
             match load_image_as_rerun_buffer(tex_path) {
                 Ok(img_buf) => {
-                    let (w, h) = image::image_dimensions(tex_path).unwrap_or((1, 1));
-                    let format = ImageFormat::rgba8([w, h]);
+                    let (w,h) = image::image_dimensions(tex_path).unwrap_or((1,1));
+                    let format = ImageFormat::rgba8([w,h]);
                     mesh3d = mesh3d.with_albedo_texture(format, img_buf);
                 }
-                Err(e) => eprintln!("Warning: failed to load texture {tex_path:?}: {e}"),
+                Err(e) => eprintln!("Warning: texture load {tex_path:?}: {e}"),
             }
         }
 
-        // (7) Log final mesh
         println!("======================");
-        println!("rerun_log");
-        println!("entity_path = '{}'", mesh_entity_path);
-        println!(" => geometry has {} vertices", mesh3d.vertex_positions.len());
-        // Actually log
+        println!("rerun_log log_trimesh");
+        println!("entity_path = '{mesh_entity_path}'");
+        println!("entity = rr.Mesh3D(...) with these numeric values:");
+        println!("  => vertex_positions (first 3):");
+        for v in mesh3d.vertex_positions.iter().take(3) {
+            println!("      [{:>7.3}, {:>7.3}, {:>7.3}]", v[0], v[1], v[2]);
+        }
+        let timeless_val = true;
+        println!("timeless = {timeless_val}");
+
+        // Finally log
+        println!("=== Stage1: Logging geometry at identity => link='{}', visual #{}", link.name, i);
         rec.log(mesh_entity_path.as_str(), &mesh3d)?;
     }
 
-    // Summarize link in a TextDocument
-    println!("======================");
-    println!("rerun_log");
-    println!("entity_path = '{}'", entity_path);
-    println!("entity = rerun::TextDocument(...)");
-    rec.log(entity_path, &TextDocument::new(doc_text))?;
+    let doc_entity = format!("{}/text_summary", entity_path);
+    rec.log(doc_entity.as_str(), &TextDocument::new(doc_text))?;
 
     Ok(())
 }
 
 // ----------------------------------------------------------------------------
-// Main entry point: parse URDF, BFS to build global link transforms, THEN log
+// Stage2: BFS apply each joint transform => child link
+fn print_joint_transform(joint: &Joint, child_link: &str, local_tf_4x4: [f32; 16], child_path: &str) {
+    println!("----------------------");
+    println!("Applying joint '{}' => child link '{}'", joint.name, child_link);
+    println!("child_path='{}'", child_path);
 
-pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> Result<()> {
-    // Parse URDF
-    let robot_model = urdf_rs::read_file(urdf_path)
-        .map_err(|e| anyhow::anyhow!("Failed to parse URDF {urdf_path:?}: {e}"))?;
-
-    // Build adjacency
-    let adjacency = build_adjacency(&robot_model.joints);
-
-    // Find root link
-    let root_link_name = find_root_link_name(&robot_model.links, &robot_model.joints)
-        .unwrap_or_else(|| "base".to_owned());
-
-    // Build link transforms AND LOG each joint transform
-    let link_global_tf_map = build_link_global_transforms_and_log_joints(
-        &adjacency,
-        &root_link_name,
-        &robot_model.joints,
-        rec,
+    let (rr, pp, yy) = (joint.origin.rpy[0], joint.origin.rpy[1], joint.origin.rpy[2]);
+    println!(
+        "Original joint RPY values: [{:>8.3}, {:>8.3}, {:>8.3}]",
+        rr, pp, yy
     );
 
-    // Collect global named materials
-    let mut all_materials_map = HashMap::new();
-    for m in &robot_model.materials {
-        all_materials_map.insert(m.name.clone(), m);
+    // Print full 4x4 matrix:
+    for row_i in 0..4 {
+        let base = row_i * 4;
+        println!(
+            "[{:8.3} {:8.3} {:8.3} {:8.3}]",
+            local_tf_4x4[base],
+            local_tf_4x4[base + 1],
+            local_tf_4x4[base + 2],
+            local_tf_4x4[base + 3],
+        );
     }
 
-    // (A) Log the root as a pretend “view coordinates”
-    println!("======================");
-    println!("rerun_log");
-    println!("entity_path = '' (root path)");
-    println!("entity = (Pretend) rr.ViewCoordinates.RIGHT_HAND_Z_UP");
-    println!("timeless = true");
+    println!("mat3x3:");
+    let (translation, mat3x3) = decompose_4x4_to_translation_and_mat3x3(local_tf_4x4);
+    for row_i in 0..3 {
+        let start = row_i * 3;
+        println!(
+            "    [{:>8.3}, {:>8.3}, {:>8.3}]",
+            mat3x3[start],
+            mat3x3[start + 1],
+            mat3x3[start + 2]
+        );
+    }
+}
 
-    // (B) BFS chain for each link => log the geometry with the accumulated transform
+/// BFS-apply each joint transform => child link,
+/// logging the resulting Transform3D to the Rerun RecordingStream.
+fn apply_joint_transforms_bfs(
+    adjacency: &HashMap<String, Vec<(Joint, String)>>,
+    root_link: &str,
+    rec: &RecordingStream,
+) -> anyhow::Result<()> {
+    let mut queue = VecDeque::new();
+    queue.push_back(root_link.to_string());
+
+    println!("=== Stage2: BFS applying joint transforms to child links");
+    println!("Root link '{}' => no local transform", root_link);
+
+    while let Some(parent) = queue.pop_front() {
+        if let Some(kids) = adjacency.get(&parent) {
+            for (joint, child_link) in kids {
+                let x = joint.origin.xyz[0];
+                let y = joint.origin.xyz[1];
+                let z = joint.origin.xyz[2];
+                let rr = joint.origin.rpy[0];
+                let pp = joint.origin.rpy[1];
+                let yy = joint.origin.rpy[2];
+
+                let local_tf_4x4 = build_4x4_from_xyz_rpy([x, y, z], [rr, pp, yy]);
+
+                if let Some(child_path) = link_entity_path(adjacency, root_link, &child_link) {
+                    // Call our new helper for printing/debug:
+                    // print_joint_transform(joint, child_link, local_tf_4x4, &child_path);
+
+                    // Decompose to a rerun::Transform3D and log it:
+                    let (translation, mat3x3) = decompose_4x4_to_translation_and_mat3x3(local_tf_4x4);
+                    let tf = Transform3D::from_translation(translation).with_mat3x3(mat3x3);
+                    rec.log(child_path.as_str(), &tf)?;
+                }
+
+                queue.push_back(child_link.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Exported function for main.rs usage
+pub fn parse_and_log_urdf_hierarchy(urdf_path: &str, rec: &RecordingStream) -> Result<()> {
+    // 0) Log a top-level coordinate system
+    rec.log("", &ViewCoordinates::RIGHT_HAND_Z_UP)?;
+
+    // 1) Parse URDF
+    let robot = urdf_rs::read_file(urdf_path)
+        .map_err(|e| anyhow::anyhow!("Failed to parse URDF {urdf_path:?}: {e}"))?;
+
+    // 2) Build adjacency
+    let adjacency = build_adjacency(&robot.joints);
+
+    // 3) Find root link
+    let root_link_name = find_root_link_name(&robot.links, &robot.joints)
+        .unwrap_or_else(|| "base".to_string());
+
+    println!("======================");
+    println!("Stage1: log geometry at identity");
     let urdf_dir = Path::new(urdf_path)
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Gather link references in a map for direct access
-    let mut link_map: HashMap<String, &Link> = HashMap::new();
-    for l in &robot_model.links {
-        link_map.insert(l.name.clone(), l);
+    // gather all named materials
+    let mut mat_map = HashMap::new();
+    for m in &robot.materials {
+        mat_map.insert(m.name.clone(), m);
     }
 
-    // For each link in the URDF
-    for link in &robot_model.links {
+    // 4) For each link, log geometry at identity
+    for link in &robot.links {
         let link_name = &link.name;
-        let entity_path = link_entity_path(&adjacency, &root_link_name, link_name)
-            .unwrap_or_else(|| link_name.to_owned());
+        let path = link_entity_path(&adjacency, &root_link_name, link_name)
+            .unwrap_or_else(|| link_name.clone());
 
-        // Grab the link’s global transform from BFS
-        let link_global_tf = link_global_tf_map
-            .get(link_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                eprintln!("Warning: no global transform found for link {}", link_name);
-                // default identity
-                [
+        log_link_meshes_at_identity(link, path.as_str(), &urdf_dir, &mat_map, rec)?;
+    }
+
+    println!("======================");
+    println!("Stage2: BFS apply local joint transforms to child links");
+    apply_joint_transforms_bfs(&adjacency, &root_link_name, rec)?;
+
+    // Optionally: print final transforms for each link
+    print_final_link_transforms(&robot);
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// parse_urdf_material
+fn parse_urdf_material(mat: &Material, urdf_dir: &Path) -> RrMaterialInfo {
+    let mut info = RrMaterialInfo::default();
+    if let Some(c) = &mat.color {
+        info.color_rgba = Some([
+            c.rgba[0] as f32,
+            c.rgba[1] as f32,
+            c.rgba[2] as f32,
+            c.rgba[3] as f32,
+        ]);
+    }
+    if let Some(tex) = &mat.texture {
+        let tex_path = urdf_dir.join(&tex.filename);
+        if tex_path.exists() {
+            info.texture_path = Some(tex_path);
+        }
+    }
+    info
+}
+
+fn float_rgba_to_u8(rgba: [f32; 4]) -> [u8; 4] {
+    [
+        (rgba[0]*255.0).clamp(0.0,255.0) as u8,
+        (rgba[1]*255.0).clamp(0.0,255.0) as u8,
+        (rgba[2]*255.0).clamp(0.0,255.0) as u8,
+        (rgba[3]*255.0).clamp(0.0,255.0) as u8,
+    ]
+}
+
+/// Load image => rerun::ImageBuffer
+fn load_image_as_rerun_buffer(path: &Path) -> Result<ImageBuffer> {
+    let img = image::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open image {path:?}: {e}"))?;
+    let rgba = img.to_rgba8().into_raw();
+    let blob = rerun::datatypes::Blob::from(rgba);
+    Ok(ImageBuffer(blob))
+}
+
+// ----------------------------------------------------------------------------
+// (Optional) print transforms for each link, BFS from root
+#[allow(dead_code)]
+fn print_final_link_transforms(robot: &urdf_rs::Robot) {
+    if let Some(root_link) = find_root_link_name(&robot.links, &robot.joints) {
+        let adjacency = build_adjacency(&robot.joints);
+
+        println!("\n========== FINAL ACCUMULATED TRANSFORMS PER LINK ==========");
+        for link in &robot.links {
+            if link.name == root_link {
+                println!("Link '{}': Root link => final transform is identity.\n", link.name);
+                continue;
+            }
+            if let Some(chain) = get_link_chain(&adjacency, &root_link, &link.name) {
+                let mut final_tf = [
                     1.0, 0.0, 0.0, 0.0,
                     0.0, 1.0, 0.0, 0.0,
                     0.0, 0.0, 1.0, 0.0,
                     0.0, 0.0, 0.0, 1.0,
-                ]
-            });
+                ];
+                let mut i = 1;
+                while i < chain.len() {
+                    let joint_name = &chain[i];
+                    i += 1;
+                    let j = robot.joints.iter().find(|jj| jj.name == *joint_name);
+                    if let Some(joint) = j {
+                        let x = joint.origin.xyz[0];
+                        let y = joint.origin.xyz[1];
+                        let z = joint.origin.xyz[2];
+                        let rr = joint.origin.rpy[0];
+                        let pp = joint.origin.rpy[1];
+                        let yy = joint.origin.rpy[2];
 
-        // Log the link’s geometry with the fully accumulated transform
-        log_link_with_global_transform(
-            link,
-            link_global_tf,
-            &entity_path,
-            &urdf_dir,
-            &all_materials_map,
-            rec,
-        )?;
+                        let local_tf_4x4 = build_4x4_from_xyz_rpy([x,y,z], [rr,pp,yy]);
+                        final_tf = mat4x4_mul(final_tf, local_tf_4x4);
+                    }
+                    i += 1;
+                }
+
+                // println!("Link '{}': BFS chain = {:?}", link.name, chain);
+                // println!("  => final_tf (4x4) =");
+                // for row_i in 0..4 {
+                //     let base = row_i * 4;
+                //     println!(
+                //         "  [{:8.3} {:8.3} {:8.3} {:8.3}]",
+                //         final_tf[base + 0],
+                //         final_tf[base + 1],
+                //         final_tf[base + 2],
+                //         final_tf[base + 3]
+                //     );
+                // }
+                // println!();
+            }
+        }
     }
-
-    Ok(())
 }
