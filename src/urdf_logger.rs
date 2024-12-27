@@ -512,6 +512,8 @@ fn log_link_meshes_at_identity(
 
 // ----------------------------------------------------------------------------
 // Stage2: BFS apply each joint transform => child link
+
+// helper function 
 fn print_joint_transform(joint: &Joint, child_link: &str, local_tf_4x4: [f32; 16], child_path: &str) {
     println!("----------------------");
     println!("Applying joint '{}' => child link '{}'", joint.name, child_link);
@@ -734,4 +736,33 @@ fn print_final_link_transforms(robot: &urdf_rs::Robot) {
             }
         }
     }
+}
+
+pub fn build_joint_name_to_entity_path(urdf_path: &str) -> Result<std::collections::HashMap<String, String>> {
+    // 1) Parse the URDF
+    let robot_model = urdf_rs::read_file(urdf_path)?;
+
+    // 2) Build adjacency
+    let adjacency = build_adjacency(&robot_model.joints);
+
+    // 3) Find root link
+    let root_link_name = find_root_link_name(&robot_model.links, &robot_model.joints)
+        .unwrap_or_else(|| "base".to_string());
+
+    // 4) For each joint, do a BFS to get the path of link-names only
+    let mut map = std::collections::HashMap::new();
+    for j in &robot_model.joints {
+        // BFS from root_link_name -> j.child.link
+        if let Some(chain) = get_link_chain(&adjacency, &root_link_name, &j.child.link) {
+            // keep only even indices => link names
+            let link_only: Vec<_> = chain
+                .iter()
+                .enumerate()
+                .filter_map(|(i, nm)| if i % 2 == 0 { Some(nm.clone()) } else { None })
+                .collect();
+            let path = link_only.join("/");
+            map.insert(j.name.clone(), path);
+        }
+    }
+    Ok(map)
 }
